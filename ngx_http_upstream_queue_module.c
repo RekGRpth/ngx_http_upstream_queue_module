@@ -19,7 +19,7 @@ typedef struct {
 
 typedef struct {
     ngx_http_request_t *request;
-    ngx_http_upstream_queue_srv_conf_t *conf;
+    ngx_http_upstream_queue_srv_conf_t *qscf;
     ngx_peer_connection_t peer;
 } ngx_http_upstream_queue_data_t;
 
@@ -27,10 +27,11 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
     ngx_http_upstream_queue_data_t *d = data;
     d->peer.free(pc, d->peer.data, state);
-    if (ngx_queue_empty(&d->conf->save)) return;
-    ngx_queue_t *q = ngx_queue_head(&d->conf->save);
+    ngx_http_upstream_queue_srv_conf_t *qscf = d->qscf;
+    if (ngx_queue_empty(&qscf->save)) return;
+    ngx_queue_t *q = ngx_queue_head(&qscf->save);
     ngx_queue_remove(q);
-    ngx_queue_insert_tail(&d->conf->free, q);
+    ngx_queue_insert_tail(&qscf->free, q);
     ngx_http_upstream_queue_save_t *s;
     s = ngx_queue_data(q, ngx_http_upstream_queue_save_t, queue);
     ngx_queue_init(&s->queue);
@@ -60,8 +61,9 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_int_t rc = d->peer.get(pc, d->peer.data);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
     if (rc != NGX_BUSY) return rc;
-    if (ngx_queue_empty(&d->conf->free)) return rc;
-    ngx_queue_t *q = ngx_queue_head(&d->conf->free);
+    ngx_http_upstream_queue_srv_conf_t *qscf = d->qscf;
+    if (ngx_queue_empty(&qscf->free)) return rc;
+    ngx_queue_t *q = ngx_queue_head(&qscf->free);
     ngx_http_upstream_queue_save_t *s = ngx_queue_data(q, ngx_http_upstream_queue_save_t, queue);
     ngx_http_request_t *r = d->request;
     ngx_pool_cleanup_t *cln;
@@ -72,9 +74,9 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     s->timeout.data = r;
     s->timeout.handler = ngx_http_upstream_queue_timeout_handler;
     s->timeout.log = pc->log;
-    ngx_add_timer(&s->timeout, d->conf->timeout);
+    ngx_add_timer(&s->timeout, qscf->timeout);
     ngx_queue_remove(q);
-    ngx_queue_insert_tail(&d->conf->save, q);
+    ngx_queue_insert_tail(&qscf->save, q);
     return NGX_DONE;
 }
 
@@ -97,7 +99,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     if (!(d = ngx_palloc(r->pool, sizeof(*d)))) return NGX_ERROR;
     if (qscf->peer.init(r, uscf) != NGX_OK) return NGX_ERROR;
     ngx_http_upstream_t *u = r->upstream;
-    d->conf = qscf;
+    d->qscf = qscf;
     d->peer = u->peer;
     d->request = r;
     u->peer.data = d;
