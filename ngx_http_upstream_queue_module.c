@@ -99,8 +99,8 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     if (!(d = ngx_palloc(r->pool, sizeof(*d)))) return NGX_ERROR;
     if (qscf->peer.init(r, uscf) != NGX_OK) return NGX_ERROR;
     ngx_http_upstream_t *u = r->upstream;
-    d->qscf = qscf;
     d->peer = u->peer;
+    d->qscf = qscf;
     d->request = r;
     u->peer.data = d;
     u->peer.free = ngx_http_upstream_queue_peer_free;
