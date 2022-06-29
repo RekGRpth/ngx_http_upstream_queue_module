@@ -1,0 +1,14 @@
+ngx_addon_name=ngx_http_upstream_queue_module
+
+NGX_HTTP_UPSTREAM_QUEUE_SRCS=$ngx_addon_dir/ngx_http_upstream_queue_module.c
+
+if test -n "$ngx_module_link"; then
+    ngx_module_name=$ngx_addon_name
+    ngx_module_srcs=$NGX_HTTP_UPSTREAM_QUEUE_SRCS
+    ngx_module_type=HTTP
+
+    . auto/module
+else
+    HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $NGX_HTTP_UPSTREAM_QUEUE_SRCS"
+fi
