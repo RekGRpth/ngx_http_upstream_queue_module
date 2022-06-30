@@ -77,7 +77,17 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_add_timer(&s->timeout, qscf->timeout);
     ngx_queue_remove(q);
     ngx_queue_insert_tail(&qscf->save, q);
-    return NGX_DONE;
+    ngx_http_upstream_t *u = r->upstream;
+    if (u->peer.connection) return NGX_AGAIN;
+    if (!(u->peer.connection = ngx_pcalloc(r->pool, sizeof(*u->peer.connection)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
+    ngx_connection_t *c = u->peer.connection;
+    if (!(c->read = ngx_pcalloc(r->pool, sizeof(*c->read)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
+    if (!(c->write = ngx_pcalloc(r->pool, sizeof(*c->write)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
+    c->read->data = c;
+    c->read->log = pc->log;
+    c->write->data = c;
+    c->write->log = pc->log;
+    return NGX_AGAIN;
 }
 
 #if (NGX_HTTP_SSL)
@@ -96,7 +106,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "%s", __func__);
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
     ngx_http_upstream_queue_data_t *d;
-    if (!(d = ngx_palloc(r->pool, sizeof(*d)))) return NGX_ERROR;
+    if (!(d = ngx_pcalloc(r->pool, sizeof(*d)))) return NGX_ERROR;
     if (qscf->peer.init(r, uscf) != NGX_OK) return NGX_ERROR;
     ngx_http_upstream_t *u = r->upstream;
     d->peer = u->peer;
