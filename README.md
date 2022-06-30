@@ -1,4 +1,4 @@
-# Nginx queue upstream connection
+# Nginx upstream queue
 
 # Directive
 
