@@ -6,7 +6,7 @@ ngx_module_t ngx_http_upstream_queue_module;
 typedef struct {
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
-    ngx_queue_t save;
+    ngx_queue_t keep;
     ngx_queue_t free;
     ngx_uint_t max;
 } ngx_http_upstream_queue_srv_conf_t;
@@ -15,7 +15,7 @@ typedef struct {
     ngx_event_t timeout;
     ngx_http_request_t *request;
     ngx_queue_t queue;
-} ngx_http_upstream_queue_save_t;
+} ngx_http_upstream_queue_keep_t;
 
 typedef struct {
     ngx_http_request_t *request;
@@ -28,14 +28,13 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_upstream_queue_data_t *d = data;
     d->peer.free(pc, d->peer.data, state);
     ngx_http_upstream_queue_srv_conf_t *qscf = d->qscf;
-    if (ngx_queue_empty(&qscf->save)) return;
-    ngx_queue_t *q = ngx_queue_head(&qscf->save);
+    if (ngx_queue_empty(&qscf->keep)) return;
+    ngx_queue_t *q = ngx_queue_head(&qscf->keep);
     ngx_queue_remove(q);
     ngx_queue_insert_tail(&qscf->free, q);
-    ngx_http_upstream_queue_save_t *s;
-    s = ngx_queue_data(q, ngx_http_upstream_queue_save_t, queue);
-    ngx_queue_init(&s->queue);
-    ngx_http_request_t *r = s->request;
+    ngx_http_upstream_queue_keep_t *k = ngx_queue_data(q, ngx_http_upstream_queue_keep_t, queue);
+    ngx_queue_init(&k->queue);
+    ngx_http_request_t *r = k->request;
     ngx_http_upstream_t *u = r->upstream;
     ngx_connection_t *c = u->peer.connection;
     if (c->read->timer_set) ngx_del_timer(c->read);
@@ -44,12 +43,12 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
-    ngx_http_upstream_queue_save_t *s = data;
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, s->request->connection->log, 0, "%s", __func__);
-    if (!ngx_queue_empty(&s->queue)) {
-        ngx_queue_remove(&s->queue);
+    ngx_http_upstream_queue_keep_t *k = data;
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, k->request->connection->log, 0, "%s", __func__);
+    if (!ngx_queue_empty(&k->queue)) {
+        ngx_queue_remove(&k->queue);
     }
-    if (s->timeout.timer_set) ngx_del_timer(&s->timeout);
+    if (k->timeout.timer_set) ngx_del_timer(&k->timeout);
 }
 
 static void ngx_http_upstream_queue_timeout_handler(ngx_event_t *e) {
@@ -69,19 +68,19 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_http_upstream_queue_srv_conf_t *qscf = d->qscf;
     if (ngx_queue_empty(&qscf->free)) return rc;
     ngx_queue_t *q = ngx_queue_head(&qscf->free);
-    ngx_http_upstream_queue_save_t *s = ngx_queue_data(q, ngx_http_upstream_queue_save_t, queue);
+    ngx_http_upstream_queue_keep_t *k = ngx_queue_data(q, ngx_http_upstream_queue_keep_t, queue);
     ngx_http_request_t *r = d->request;
     ngx_pool_cleanup_t *cln;
     if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add"); return NGX_ERROR; }
     cln->handler = ngx_http_upstream_queue_cleanup_handler;
-    cln->data = s;
-    s->request = r;
-    s->timeout.data = r;
-    s->timeout.handler = ngx_http_upstream_queue_timeout_handler;
-    s->timeout.log = pc->log;
-    ngx_add_timer(&s->timeout, qscf->timeout);
+    cln->data = k;
+    k->request = r;
+    k->timeout.data = r;
+    k->timeout.handler = ngx_http_upstream_queue_timeout_handler;
+    k->timeout.log = pc->log;
+    ngx_add_timer(&k->timeout, qscf->timeout);
     ngx_queue_remove(q);
-    ngx_queue_insert_tail(&qscf->save, q);
+    ngx_queue_insert_tail(&qscf->keep, q);
     ngx_http_upstream_t *u = r->upstream;
     if (u->peer.connection) return NGX_AGAIN;
     if (!(u->peer.connection = ngx_pcalloc(r->pool, sizeof(*u->peer.connection)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
@@ -133,11 +132,11 @@ static ngx_int_t ngx_http_upstream_queue_peer_init_upstream(ngx_conf_t *cf, ngx_
     if (qscf->peer.init_upstream(cf, uscf) != NGX_OK) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "init_upstream != NGX_OK"); return NGX_ERROR; }
     qscf->peer.init = uscf->peer.init;
     uscf->peer.init = ngx_http_upstream_queue_peer_init;
-    ngx_http_upstream_queue_save_t *s;
-    if (!(s = ngx_pcalloc(cf->pool, sizeof(*s) * qscf->max))) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "!ngx_pcalloc"); return NGX_ERROR; }
-    ngx_queue_init(&qscf->save);
+    ngx_http_upstream_queue_keep_t *k;
+    if (!(k = ngx_pcalloc(cf->pool, sizeof(*k) * qscf->max))) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "!ngx_pcalloc"); return NGX_ERROR; }
+    ngx_queue_init(&qscf->keep);
     ngx_queue_init(&qscf->free);
-    for (ngx_uint_t i = 0; i < qscf->max; i++) { ngx_queue_insert_head(&qscf->free, &s[i].queue); }
+    for (ngx_uint_t i = 0; i < qscf->max; i++) { ngx_queue_insert_head(&qscf->free, &k[i].queue); }
     return NGX_OK;
 }
 
