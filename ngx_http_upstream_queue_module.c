@@ -38,14 +38,17 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_request_t *r = s->request;
     ngx_http_upstream_t *u = r->upstream;
     ngx_connection_t *c = u->peer.connection;
-    ngx_del_timer(c->write);
+    if (c->read->timer_set) ngx_del_timer(c->read);
+    if (c->write->timer_set) ngx_del_timer(c->write);
     ngx_http_upstream_connect(r, u);
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
     ngx_http_upstream_queue_save_t *s = data;
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, s->request->connection->log, 0, "%s", __func__);
-    if (!ngx_queue_empty(&s->queue)) { ngx_queue_remove(&s->queue); }
+    if (!ngx_queue_empty(&s->queue)) {
+        ngx_queue_remove(&s->queue);
+    }
     if (s->timeout.timer_set) ngx_del_timer(&s->timeout);
 }
 
