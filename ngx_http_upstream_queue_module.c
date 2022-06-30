@@ -6,8 +6,8 @@ ngx_module_t ngx_http_upstream_queue_module;
 typedef struct {
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
-    ngx_queue_t keep;
     ngx_queue_t free;
+    ngx_queue_t queue;
     ngx_uint_t max;
 } ngx_http_upstream_queue_srv_conf_t;
 
@@ -30,8 +30,8 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    if (ngx_queue_empty(&qscf->keep)) return;
-    ngx_queue_t *q = ngx_queue_head(&qscf->keep);
+    if (ngx_queue_empty(&qscf->queue)) return;
+    ngx_queue_t *q = ngx_queue_head(&qscf->queue);
     ngx_queue_remove(q);
     ngx_queue_insert_tail(&qscf->free, q);
     ngx_http_upstream_queue_keep_t *k = ngx_queue_data(q, ngx_http_upstream_queue_keep_t, queue);
@@ -84,7 +84,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     k->timeout.log = pc->log;
     ngx_add_timer(&k->timeout, qscf->timeout);
     ngx_queue_remove(q);
-    ngx_queue_insert_tail(&qscf->keep, q);
+    ngx_queue_insert_tail(&qscf->queue, q);
     if (u->peer.connection) return NGX_AGAIN;
     if (!(u->peer.connection = ngx_pcalloc(r->pool, sizeof(*u->peer.connection)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
     ngx_connection_t *c = u->peer.connection;
@@ -136,7 +136,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init_upstream(ngx_conf_t *cf, ngx_
     uscf->peer.init = ngx_http_upstream_queue_peer_init;
     ngx_http_upstream_queue_keep_t *k;
     if (!(k = ngx_pcalloc(cf->pool, sizeof(*k) * qscf->max))) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "!ngx_pcalloc"); return NGX_ERROR; }
-    ngx_queue_init(&qscf->keep);
+    ngx_queue_init(&qscf->queue);
     ngx_queue_init(&qscf->free);
     for (ngx_uint_t i = 0; i < qscf->max; i++) { ngx_queue_insert_head(&qscf->free, &k[i].queue); }
     return NGX_OK;
