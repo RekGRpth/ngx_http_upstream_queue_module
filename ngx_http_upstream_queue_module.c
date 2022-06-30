@@ -37,6 +37,8 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_queue_init(&s->queue);
     ngx_http_request_t *r = s->request;
     ngx_http_upstream_t *u = r->upstream;
+    ngx_connection_t *c = u->peer.connection;
+    ngx_del_timer(c->write);
     ngx_http_upstream_connect(r, u);
 }
 
