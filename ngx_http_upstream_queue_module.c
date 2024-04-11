@@ -78,15 +78,8 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     d->timeout.log = pc->log;
     ngx_add_timer(&d->timeout, qscf->timeout);
     queue_insert_tail(&qscf->queue, &d->queue);
-    if (u->peer.connection) return NGX_AGAIN;
-    if (!(u->peer.connection = ngx_pcalloc(r->pool, sizeof(*u->peer.connection)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
-    ngx_connection_t *c = u->peer.connection;
-    if (!(c->read = ngx_pcalloc(r->pool, sizeof(*c->read)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
-    if (!(c->write = ngx_pcalloc(r->pool, sizeof(*c->write)))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pcalloc"); return NGX_ERROR; }
-    c->read->data = c;
-    c->read->log = pc->log;
-    c->write->data = c;
-    c->write->log = pc->log;
+    if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
+    pc->connection->shared = 1;
     return NGX_AGAIN;
 }
 
