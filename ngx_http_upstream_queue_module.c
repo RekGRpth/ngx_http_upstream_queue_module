@@ -76,7 +76,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     d->timeout.data = r;
     d->timeout.handler = ngx_http_upstream_queue_timeout_handler;
     d->timeout.log = pc->log;
-    ngx_add_timer(&d->timeout, qscf->timeout);
+    ngx_add_timer(&d->timeout, ngx_min(u->conf->connect_timeout, qscf->timeout));
     queue_insert_tail(&qscf->queue, &d->queue);
     if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
     pc->connection->shared = 1;
