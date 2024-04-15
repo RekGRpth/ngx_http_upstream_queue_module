@@ -34,8 +34,8 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     r = d->request;
     u = r->upstream;
     ngx_connection_t *c = u->peer.connection;
-    if (c->read->timer_set) ngx_del_timer(c->read);
-    if (c->write->timer_set) ngx_del_timer(c->write);
+    ngx_close_connection(c);
+    c->shared = 0;
     ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
     ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
     ngx_http_upstream_connect(r, u);
