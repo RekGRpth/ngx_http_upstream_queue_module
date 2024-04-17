@@ -69,6 +69,8 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
     if (queue_size(&qscf->queue) >= qscf->max) return rc;
+    if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
+    pc->connection->shared = 1;
     ngx_pool_cleanup_t *cln;
     if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add"); return NGX_ERROR; }
     cln->handler = ngx_http_upstream_queue_cleanup_handler;
@@ -78,8 +80,6 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     d->timeout.log = pc->log;
     ngx_add_timer(&d->timeout, ngx_min(u->conf->connect_timeout, qscf->timeout));
     queue_insert_tail(&qscf->queue, &d->queue);
-    if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
-    pc->connection->shared = 1;
     return NGX_AGAIN;
 }
 
