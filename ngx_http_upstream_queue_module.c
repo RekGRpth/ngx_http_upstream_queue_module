@@ -12,6 +12,7 @@ typedef struct {
 } ngx_http_upstream_queue_srv_conf_t;
 
 typedef struct {
+    ngx_event_t connect_timeout;
     ngx_event_t timeout;
     ngx_http_request_t *request;
     ngx_peer_connection_t peer;
@@ -50,6 +51,12 @@ static void ngx_http_upstream_queue_cleanup_handler(void *data) {
     if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
 }
 
+static void ngx_http_upstream_queue_connect_timeout_handler(ngx_event_t *e) {
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, e->write ? "write" : "read");
+    ngx_connection_t *c = e->data;
+    if (c->write->timer_set) ngx_del_timer(c->write);
+}
+
 static void ngx_http_upstream_queue_timeout_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, e->write ? "write" : "read");
     ngx_http_request_t *r = e->data;
@@ -75,10 +82,16 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add"); return NGX_ERROR; }
     cln->handler = ngx_http_upstream_queue_cleanup_handler;
     cln->data = d;
+    if (u->conf->connect_timeout < qscf->timeout) {
+        d->connect_timeout.data = pc->connection;
+        d->connect_timeout.handler = ngx_http_upstream_queue_connect_timeout_handler;
+        d->connect_timeout.log = pc->log;
+        ngx_add_timer(&d->connect_timeout, ngx_min(u->conf->connect_timeout, 1000));
+    }
     d->timeout.data = r;
     d->timeout.handler = ngx_http_upstream_queue_timeout_handler;
     d->timeout.log = pc->log;
-    ngx_add_timer(&d->timeout, ngx_min(u->conf->connect_timeout, qscf->timeout));
+    ngx_add_timer(&d->timeout, qscf->timeout);
     queue_insert_tail(&qscf->queue, &d->queue);
     return NGX_AGAIN;
 }
