@@ -31,6 +31,8 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     queue_t *q = queue_head(&qscf->queue);
     queue_remove(q);
     d = queue_data(q, ngx_http_upstream_queue_data_t, queue);
+    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
+    if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
     queue_init(&d->queue);
     r = d->request;
     u = r->upstream;
@@ -48,6 +50,7 @@ static void ngx_http_upstream_queue_cleanup_handler(void *data) {
     ngx_http_upstream_queue_data_t *d = data;
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, d->request->connection->log, 0, "%s", __func__);
     if (!queue_empty(&d->queue)) queue_remove(&d->queue);
+    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
     if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
 }
 
@@ -86,7 +89,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
         d->connect_timeout.data = pc->connection;
         d->connect_timeout.handler = ngx_http_upstream_queue_connect_timeout_handler;
         d->connect_timeout.log = pc->log;
-        ngx_add_timer(&d->connect_timeout, ngx_min(u->conf->connect_timeout, 1000));
+        ngx_add_timer(&d->connect_timeout, u->conf->connect_timeout / 2);
     }
     d->timeout.data = r;
     d->timeout.handler = ngx_http_upstream_queue_timeout_handler;
