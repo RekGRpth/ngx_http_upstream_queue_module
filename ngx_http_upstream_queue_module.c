@@ -119,6 +119,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     queue_init(&d->queue);
     if (qscf->peer.init(r, uscf) != NGX_OK) return NGX_ERROR;
     ngx_http_upstream_t *u = r->upstream;
+    u->conf->upstream = uscf;
     d->peer = u->peer;
     d->request = r;
     u->peer.data = d;
