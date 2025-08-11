@@ -74,6 +74,17 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_int_t rc = d->peer.get(pc, d->peer.data);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
     if (rc != NGX_BUSY) return rc;
+    ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
+    time_t now = ngx_time();
+    ngx_flag_t all_peers_down = 1;
+    for (ngx_http_upstream_rr_peer_t *peer = rrp->peers->peer; peer; peer = peer->next) {
+        if (!peer->down) {
+            if (peer->max_fails && peer->fails <= peer->max_fails && now - peer->checked <= peer->fail_timeout) continue;
+            all_peers_down = 0;
+            break;
+        }
+    }
+    if (all_peers_down)  return rc;
     ngx_http_request_t *r = d->request;
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
