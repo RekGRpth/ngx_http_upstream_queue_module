@@ -79,7 +79,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_flag_t all_peers_down = 1;
     for (ngx_http_upstream_rr_peer_t *peer = rrp->peers->peer; peer; peer = peer->next) {
         if (!peer->down) {
-            if (peer->max_fails && peer->fails <= peer->max_fails && now - peer->checked <= peer->fail_timeout) continue;
+            if (peer->max_fails && peer->fails >= peer->max_fails && now - peer->checked <= peer->fail_timeout) continue;
             all_peers_down = 0;
             break;
         }
