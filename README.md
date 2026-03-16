@@ -21,3 +21,18 @@ queue_detect_all_peer_down;
 * Context: upstream
 
 Enables/disables detect all peer down
+
+## Optional immediate post-resolve hook
+
+An optional NGINX core patch is provided at `patches/nginx-upstream-zone-post-resolve-hook.patch`.
+
+- Without the patch, this module still works (event + retry fallback path).
+- With the patch, this module additionally hooks upstream-zone resolve completion and wakes queue immediately after DNS peer updates.
+
+The module is guarded with `#if (NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK)` so it compiles on both patched and unpatched NGINX trees.
+
+Apply patch from NGINX source root:
+
+```bash
+patch -p1 < /path/to/ngx_http_upstream_queue_module/patches/nginx-upstream-zone-post-resolve-hook.patch
+```
