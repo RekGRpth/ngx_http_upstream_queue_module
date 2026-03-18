@@ -1,0 +1,47 @@
+diff --git a/src/http/ngx_http_upstream.h b/src/http/ngx_http_upstream.h
+--- a/src/http/ngx_http_upstream.h
++++ b/src/http/ngx_http_upstream.h
+@@ -88,5 +88,13 @@ typedef ngx_int_t (*ngx_http_upstream_init_peer_pt)(ngx_http_request_t *r,
+     ngx_http_upstream_srv_conf_t *us);
+ 
++#if (NGX_HTTP_UPSTREAM_ZONE)
++typedef void (*ngx_http_upstream_zone_post_resolve_pt)(
++    ngx_http_upstream_srv_conf_t *uscf);
++extern ngx_http_upstream_zone_post_resolve_pt
++    ngx_http_upstream_zone_post_resolve;
++#define NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK 1
++#endif
++
+ typedef struct {
+     ngx_http_upstream_init_pt        init_upstream;
+     ngx_http_upstream_init_peer_pt   init;
+diff --git a/src/http/ngx_http_upstream.c b/src/http/ngx_http_upstream.c
+--- a/src/http/ngx_http_upstream.c
++++ b/src/http/ngx_http_upstream.c
+@@ -8,6 +8,10 @@
+ #include <ngx_core.h>
+ #include <ngx_http.h>
+ 
++#if (NGX_HTTP_UPSTREAM_ZONE)
++ngx_http_upstream_zone_post_resolve_pt ngx_http_upstream_zone_post_resolve;
++#endif
++
+ #if (NGX_HTTP_CACHE)
+ static ngx_int_t ngx_http_upstream_cache(ngx_http_request_t *r,
+     ngx_http_upstream_t *u);
+diff --git a/src/http/modules/ngx_http_upstream_zone_module.c b/src/http/modules/ngx_http_upstream_zone_module.c
+--- a/src/http/modules/ngx_http_upstream_zone_module.c
++++ b/src/http/modules/ngx_http_upstream_zone_module.c
+@@ -1021,6 +1021,12 @@ done:
+ 
+     ngx_http_upstream_rr_peers_unlock(peers);
+ 
++#if (NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK)
++    if (ngx_http_upstream_zone_post_resolve) {
++        ngx_http_upstream_zone_post_resolve(uscf);
++    }
++#endif
++
+     while (++i < ctx->naddrs) {
+         ngx_http_upstream_zone_unmark_addr(&ctx->addrs[i]);
+     }

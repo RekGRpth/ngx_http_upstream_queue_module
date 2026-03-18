@@ -2,13 +2,19 @@
 #include "ngx_http_upstream.c"
 #include "queue.h"
 
+#ifndef NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK
+#define NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK 0
+#endif
+
 ngx_module_t ngx_http_upstream_queue_module;
 
 typedef struct {
     ngx_flag_t detect;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
+    ngx_msec_t retry_interval;
     ngx_uint_t max;
+    ngx_event_t retry;
     queue_t queue;
 } ngx_http_upstream_queue_srv_conf_t;
 
@@ -17,8 +23,111 @@ typedef struct {
     ngx_event_t timeout;
     ngx_http_request_t *request;
     ngx_peer_connection_t peer;
+    ngx_flag_t cleanup_registered;
     queue_t queue;
 } ngx_http_upstream_queue_data_t;
+
+static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e);
+static ngx_int_t ngx_http_upstream_queue_init_process(ngx_cycle_t *cycle);
+static void ngx_http_upstream_queue_close_shared_connection(ngx_http_request_t *r);
+
+#if (NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK)
+extern void (*ngx_http_upstream_zone_post_resolve)(ngx_http_upstream_srv_conf_t *uscf);
+static void (*ngx_http_upstream_queue_zone_post_resolve_next)(ngx_http_upstream_srv_conf_t *uscf);
+static void ngx_http_upstream_queue_zone_post_resolve(ngx_http_upstream_srv_conf_t *uscf);
+#endif
+
+static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_conf_t *qscf,
+    ngx_log_t *log)
+{
+    if (queue_empty(&qscf->queue) || qscf->retry.posted || qscf->retry.timer_set) return;
+
+    qscf->retry.data = qscf;
+    qscf->retry.handler = ngx_http_upstream_queue_retry_handler;
+    qscf->retry.log = log ? log : ngx_cycle->log;
+    qscf->retry.cancelable = 1;
+
+    ngx_add_timer(&qscf->retry, qscf->retry_interval);
+}
+
+static void ngx_http_upstream_queue_close_shared_connection(ngx_http_request_t *r) {
+    if (!r || !r->upstream) return;
+
+    ngx_http_upstream_t *u = r->upstream;
+    ngx_connection_t *c = u->peer.connection;
+
+    if (!c) return;
+    if (!c->shared) return;
+
+    u->peer.connection = NULL;
+    ngx_close_connection(c);
+}
+
+static void ngx_http_upstream_queue_wake_one(ngx_http_upstream_queue_srv_conf_t *qscf) {
+    if (queue_empty(&qscf->queue)) return;
+    queue_t *q = queue_head(&qscf->queue);
+    queue_remove(q);
+
+    ngx_http_upstream_queue_data_t *d = queue_data(q, ngx_http_upstream_queue_data_t, queue);
+    ngx_http_request_t *r = d->request;
+    if (!r || !r->upstream || !r->connection || r->connection->error) {
+        ngx_log_error(NGX_LOG_ERR, r ? r->connection->log : ngx_cycle->log, 0, "invalid request in queue");
+        return;
+    }
+
+    //ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "waking up queued request");
+
+    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
+    if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
+    queue_init(&d->queue);
+
+    ngx_http_upstream_t *u = r->upstream;
+    ngx_connection_t *c = u->peer.connection;
+    if (c && c->shared) {
+        u->peer.connection = NULL;
+        ngx_close_connection(c);
+        c->shared = 0;
+    }
+
+    ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
+    ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
+
+    ngx_http_upstream_connect(r, u);
+
+    u->read_event_handler = read_event_handler;
+    u->write_event_handler = write_event_handler;
+}
+
+static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
+    ngx_http_upstream_queue_srv_conf_t *qscf = e->data;
+    ngx_http_upstream_queue_wake_one(qscf);
+    ngx_http_upstream_queue_retry_schedule(qscf, e->log);
+}
+
+#if (NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK)
+static void ngx_http_upstream_queue_zone_post_resolve(ngx_http_upstream_srv_conf_t *uscf) {
+    if (ngx_http_upstream_queue_zone_post_resolve_next) {
+        ngx_http_upstream_queue_zone_post_resolve_next(uscf);
+    }
+
+    ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
+    if (!qscf || !qscf->max) return;
+
+    ngx_http_upstream_queue_wake_one(qscf);
+    ngx_http_upstream_queue_retry_schedule(qscf, uscf->resolver ? uscf->resolver->log : ngx_cycle->log);
+}
+#endif
+
+static ngx_int_t ngx_http_upstream_queue_init_process(ngx_cycle_t *cycle) {
+#if (NGX_HTTP_UPSTREAM_QUEUE_RESOLVE_HOOK)
+    if (ngx_http_upstream_zone_post_resolve != ngx_http_upstream_queue_zone_post_resolve) {
+        ngx_http_upstream_queue_zone_post_resolve_next = ngx_http_upstream_zone_post_resolve;
+        ngx_http_upstream_zone_post_resolve = ngx_http_upstream_queue_zone_post_resolve;
+    }
+#endif
+
+    return NGX_OK;
+}
 
 static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
@@ -28,29 +137,28 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    if (queue_empty(&qscf->queue)) return;
-    queue_t *q = queue_head(&qscf->queue);
-    queue_remove(q);
-    d = queue_data(q, ngx_http_upstream_queue_data_t, queue);
-    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
-    if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
-    queue_init(&d->queue);
-    r = d->request;
-    u = r->upstream;
-    ngx_connection_t *c = u->peer.connection;
-    ngx_close_connection(c);
-    c->shared = 0;
-    ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
-    ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
-    ngx_http_upstream_connect(r, u);
-    u->read_event_handler = read_event_handler;
-    u->write_event_handler = write_event_handler;
+    ngx_http_upstream_queue_wake_one(qscf);
+    ngx_http_upstream_queue_retry_schedule(qscf, pc->log);
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
     ngx_http_upstream_queue_data_t *d = data;
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, d->request->connection->log, 0, "%s", __func__);
-    if (!queue_empty(&d->queue)) queue_remove(&d->queue);
+    if (!queue_empty(&d->queue)) {
+        ngx_http_request_t *r = d->request;
+        ngx_http_upstream_t *u = r ? r->upstream : NULL;
+        ngx_http_upstream_srv_conf_t *uscf = (u && u->conf) ? u->conf->upstream : NULL;
+        ngx_http_upstream_queue_srv_conf_t *qscf = uscf
+            ? ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module)
+            : NULL;
+
+        queue_remove(&d->queue);
+
+        if (qscf) ngx_http_upstream_queue_retry_schedule(qscf, r->connection->log);
+    }
+
+    ngx_http_upstream_queue_close_shared_connection(d->request);
+
     if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
     if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
 }
@@ -83,6 +191,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
         ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
         time_t now = ngx_time();
         ngx_flag_t all_peers_down = 1;
+        ngx_http_upstream_rr_peers_rlock(rrp->peers);
         for (ngx_http_upstream_rr_peer_t *peer = rrp->peers->peer; peer; peer = peer->next) {
             if (!peer->down) {
                 if (peer->max_fails && peer->fails >= peer->max_fails && now - peer->checked <= peer->fail_timeout) continue;
@@ -90,15 +199,43 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
                 break;
             }
         }
+        ngx_http_upstream_rr_peers_unlock(rrp->peers);
         if (all_peers_down) return rc;
     }
+
+    if (!queue_empty(&d->queue)) {
+        if (u->peer.connection == NULL) {
+            if (!(u->peer.connection = ngx_get_connection(0, pc->log))) {
+                ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection (already queued)");
+                return NGX_ERROR;
+            }
+
+            u->peer.connection->shared = 1;
+        }
+
+        pc->connection = u->peer.connection;
+        ngx_http_upstream_queue_retry_schedule(qscf, pc->log);
+        return NGX_AGAIN;
+    }
+
     if (queue_size(&qscf->queue) >= qscf->max) return rc;
-    if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
-    pc->connection->shared = 1;
-    ngx_pool_cleanup_t *cln;
-    if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add"); return NGX_ERROR; }
-    cln->handler = ngx_http_upstream_queue_cleanup_handler;
-    cln->data = d;
+    if (u->peer.connection && u->peer.connection->shared) {
+        pc->connection = u->peer.connection;
+    } else {
+        if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
+        pc->connection->shared = 1;
+    }
+    if (!d->cleanup_registered) {
+        ngx_pool_cleanup_t *cln;
+        if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) {
+            ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add");
+            ngx_http_upstream_queue_close_shared_connection(r);
+            return NGX_ERROR;
+        }
+        cln->handler = ngx_http_upstream_queue_cleanup_handler;
+        cln->data = d;
+        d->cleanup_registered = 1;
+    }
     if (u->conf->connect_timeout < qscf->timeout) {
         d->connect_timeout.data = pc->connection;
         d->connect_timeout.handler = ngx_http_upstream_queue_connect_timeout_handler;
@@ -110,6 +247,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     d->timeout.log = pc->log;
     ngx_add_timer(&d->timeout, qscf->timeout);
     queue_insert_tail(&qscf->queue, &d->queue);
+    ngx_http_upstream_queue_retry_schedule(qscf, pc->log);
     return NGX_AGAIN;
 }
 
@@ -150,6 +288,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init_upstream(ngx_conf_t *cf, ngx_
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
     ngx_conf_init_value(qscf->detect, 0);
     ngx_conf_init_msec_value(qscf->timeout, 60000);
+    ngx_conf_init_msec_value(qscf->retry_interval, 200);
     if (qscf->peer.init_upstream(cf, uscf) != NGX_OK) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "init_upstream != NGX_OK"); return NGX_ERROR; }
     qscf->peer.init = uscf->peer.init;
     uscf->peer.init = ngx_http_upstream_queue_peer_init;
@@ -162,6 +301,7 @@ static void *ngx_http_upstream_queue_create_srv_conf(ngx_conf_t *cf) {
     if (!(conf = ngx_pcalloc(cf->pool, sizeof(*conf)))) return NULL;
     conf->detect = NGX_CONF_UNSET;
     conf->timeout = NGX_CONF_UNSET_MSEC;
+    conf->retry_interval = NGX_CONF_UNSET_MSEC;
     return conf;
 }
 
@@ -210,7 +350,7 @@ ngx_module_t ngx_http_upstream_queue_module = {
     .type = NGX_HTTP_MODULE,
     .init_master = NULL,
     .init_module = NULL,
-    .init_process = NULL,
+    .init_process = ngx_http_upstream_queue_init_process,
     .init_thread = NULL,
     .exit_thread = NULL,
     .exit_process = NULL,
