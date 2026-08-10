@@ -7,6 +7,7 @@ ngx_module_t ngx_http_upstream_queue_module;
 typedef struct {
     ngx_flag_t detect;
     ngx_flag_t draining;
+    ngx_flag_t reentered;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
     ngx_uint_t max;
@@ -29,7 +30,7 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    if (qscf->draining) return;
+    if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
     while (!queue_empty(&qscf->queue)) {
         queue_t *q = queue_head(&qscf->queue);
@@ -45,9 +46,20 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
         c->shared = 0;
         ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
         ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
+        qscf->reentered = 0;
         ngx_http_upstream_connect(r, u);
         u->read_event_handler = read_event_handler;
         u->write_event_handler = write_event_handler;
+        /*
+         * ngx_http_upstream_connect() only re-enters this function
+         * (caught above via draining) when the just-dequeued request's
+         * connect fails synchronously. Anything else - a real connect
+         * left in progress, or one that succeeded outright - means the
+         * peer slot this drain pass freed up is now spoken for again;
+         * further queued requests must wait for their own turn instead
+         * of being popped speculatively.
+         */
+        if (!qscf->reentered) break;
     }
     qscf->draining = 0;
 }
