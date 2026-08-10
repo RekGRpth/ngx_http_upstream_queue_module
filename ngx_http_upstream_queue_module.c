@@ -111,7 +111,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     }
     cln->handler = ngx_http_upstream_queue_cleanup_handler;
     cln->data = d;
-    if (u->conf->connect_timeout < qscf->timeout) {
+    if (u->conf->connect_timeout <= qscf->timeout) {
         d->connect_timeout.data = pc->connection;
         d->connect_timeout.handler = ngx_http_upstream_queue_connect_timeout_handler;
         d->connect_timeout.log = pc->log;
