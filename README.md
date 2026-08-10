@@ -21,3 +21,5 @@ queue_detect_all_peer_down;
 * Context: upstream
 
 Enables/disables detect all peer down
+
+Only supported with load balancer methods built on top of the standard round-robin peer data (the default round-robin, `least_conn`, `ip_hash`, `hash`, and `random`); third-party balancer modules that do not embed `ngx_http_upstream_rr_peer_data_t` are not supported.
