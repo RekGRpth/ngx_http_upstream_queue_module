@@ -88,6 +88,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
         ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
         time_t now = ngx_time();
         ngx_flag_t all_peers_down = 1;
+        ngx_http_upstream_rr_peers_wlock(rrp->peers);
         for (ngx_http_upstream_rr_peer_t *peer = rrp->peers->peer; peer; peer = peer->next) {
             if (!peer->down) {
                 if (peer->max_fails && peer->fails >= peer->max_fails && now - peer->checked <= peer->fail_timeout) continue;
@@ -95,6 +96,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
                 break;
             }
         }
+        ngx_http_upstream_rr_peers_unlock(rrp->peers);
         if (all_peers_down) return rc;
     }
     if (queue_size(&qscf->queue) >= qscf->max) return rc;
