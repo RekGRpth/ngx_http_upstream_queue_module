@@ -38,7 +38,7 @@ if (!-x $nginx || !-e $module) {
 my $testdir = tempdir('nginx-queue-directive-XXXXXXXXXX', TMPDIR => 1,
 	CLEANUP => 1);
 
-plan(tests => 9);
+plan(tests => 12);
 
 is(conf_test("queue 10;"), 0, 'queue N: valid, minimal form');
 is(conf_test("queue 10 timeout=30s;"), 0, 'queue N timeout=T: valid form');
@@ -52,6 +52,17 @@ isnt(conf_test("queue 10 timeout=abc;"), 0,
 isnt(conf_test("queue 10 badparam=5s;"), 0,
 	'queue N <unknown param>=...: rejected');
 isnt(conf_test("queue 10; queue 20;"), 0, 'queue given twice: rejected');
+
+# queue_detect_all_peer_down reads state (peer.data laid out as
+# ngx_http_upstream_rr_peer_data_t, fails/checked/down bookkeeping) that
+# is only wired up by the "queue" directive; without it the flag would
+# silently do nothing at runtime, so postconfiguration rejects it.
+isnt(conf_test("queue_detect_all_peer_down on;"), 0,
+	'queue_detect_all_peer_down on without queue: rejected');
+is(conf_test("queue 10; queue_detect_all_peer_down on;"), 0,
+	'queue_detect_all_peer_down on with queue: valid');
+is(conf_test("queue_detect_all_peer_down off;"), 0,
+	'queue_detect_all_peer_down off without queue: valid (default anyway)');
 
 ###############################################################################
 
