@@ -188,9 +188,9 @@ static char *ngx_http_upstream_queue_ups_conf(ngx_conf_t *cf, ngx_command_t *cmd
         if (value[2].len <= sizeof("timeout=") - 1 || ngx_strncmp(value[2].data, (u_char *)"timeout=", sizeof("timeout=") - 1)) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid name \"%V\" in \"%V\" directive", &value[2], &cmd->name); return NGX_CONF_ERROR; }
         value[2].data += sizeof("timeout=") - 1;
         value[2].len -= sizeof("timeout=") - 1;
-        ngx_int_t n = ngx_parse_time(&value[2], 0);
-        if (n == NGX_ERROR) return "ngx_parse_time == NGX_ERROR";
-        qscf->timeout = (ngx_msec_t)n;
+        ngx_int_t timeout = ngx_parse_time(&value[2], 0);
+        if (timeout == NGX_ERROR) return "ngx_parse_time == NGX_ERROR";
+        qscf->timeout = (ngx_msec_t)timeout;
     }
     ngx_http_upstream_srv_conf_t *uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
     qscf->peer.init_upstream = uscf->peer.init_upstream ? uscf->peer.init_upstream : ngx_http_upstream_init_round_robin;
