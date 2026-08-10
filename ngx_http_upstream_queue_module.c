@@ -6,6 +6,7 @@ ngx_module_t ngx_http_upstream_queue_module;
 
 typedef struct {
     ngx_flag_t detect;
+    ngx_flag_t draining;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
     ngx_uint_t max;
@@ -28,23 +29,27 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    if (queue_empty(&qscf->queue)) return;
-    queue_t *q = queue_head(&qscf->queue);
-    queue_remove(q);
-    d = queue_data(q, ngx_http_upstream_queue_data_t, queue);
-    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
-    if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
-    queue_init(&d->queue);
-    r = d->request;
-    u = r->upstream;
-    ngx_connection_t *c = u->peer.connection;
-    ngx_close_connection(c);
-    c->shared = 0;
-    ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
-    ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
-    ngx_http_upstream_connect(r, u);
-    u->read_event_handler = read_event_handler;
-    u->write_event_handler = write_event_handler;
+    if (qscf->draining) return;
+    qscf->draining = 1;
+    while (!queue_empty(&qscf->queue)) {
+        queue_t *q = queue_head(&qscf->queue);
+        queue_remove(q);
+        d = queue_data(q, ngx_http_upstream_queue_data_t, queue);
+        if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
+        if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
+        queue_init(&d->queue);
+        r = d->request;
+        u = r->upstream;
+        ngx_connection_t *c = u->peer.connection;
+        ngx_close_connection(c);
+        c->shared = 0;
+        ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
+        ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
+        ngx_http_upstream_connect(r, u);
+        u->read_event_handler = read_event_handler;
+        u->write_event_handler = write_event_handler;
+    }
+    qscf->draining = 0;
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
