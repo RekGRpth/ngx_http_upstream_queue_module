@@ -101,7 +101,14 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     if (!(pc->connection = ngx_get_connection(0, pc->log))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_get_connection"); return NGX_ERROR; }
     pc->connection->shared = 1;
     ngx_pool_cleanup_t *cln;
-    if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) { ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add"); return NGX_ERROR; }
+    if (!(cln = ngx_pool_cleanup_add(r->pool, 0))) {
+        ngx_log_error(NGX_LOG_ERR, pc->log, 0, "!ngx_pool_cleanup_add");
+        ngx_connection_t *c = pc->connection;
+        ngx_close_connection(c);
+        c->shared = 0;
+        pc->connection = NULL;
+        return NGX_ERROR;
+    }
     cln->handler = ngx_http_upstream_queue_cleanup_handler;
     cln->data = d;
     if (u->conf->connect_timeout < qscf->timeout) {
