@@ -38,10 +38,17 @@ if (!-x $nginx || !-e $module) {
 my $testdir = tempdir('nginx-queue-directive-XXXXXXXXXX', TMPDIR => 1,
 	CLEANUP => 1);
 
-plan(tests => 13);
+plan(tests => 20);
 
 is(conf_test("queue 10;"), 0, 'queue N: valid, minimal form');
 is(conf_test("queue 10 timeout=30s;"), 0, 'queue N timeout=T: valid form');
+is(conf_test("queue 10 retry_interval=50ms;"), 0,
+	'queue N retry_interval=I: valid form');
+is(conf_test("queue 10 timeout=30s retry_interval=50ms;"), 0,
+	'queue N timeout=T retry_interval=I: valid form, timeout first');
+is(conf_test("queue 10 retry_interval=50ms timeout=30s;"), 0,
+	'queue N retry_interval=I timeout=T: valid form, retry_interval first '
+	. '(order-independent)');
 
 isnt(conf_test("queue 0;"), 0, 'queue 0: rejected');
 isnt(conf_test("queue abc;"), 0, 'queue <non-numeric>: rejected');
@@ -49,8 +56,16 @@ isnt(conf_test("queue -5;"), 0, 'queue <negative>: rejected');
 isnt(conf_test("queue 10 timeout=;"), 0, 'queue N timeout=<empty>: rejected');
 isnt(conf_test("queue 10 timeout=abc;"), 0,
 	'queue N timeout=<not a time>: rejected');
+isnt(conf_test("queue 10 retry_interval=;"), 0,
+	'queue N retry_interval=<empty>: rejected');
+isnt(conf_test("queue 10 retry_interval=abc;"), 0,
+	'queue N retry_interval=<not a time>: rejected');
+isnt(conf_test("queue 10 retry_interval=0;"), 0,
+	'queue N retry_interval=0: rejected');
 isnt(conf_test("queue 10 badparam=5s;"), 0,
 	'queue N <unknown param>=...: rejected');
+isnt(conf_test("queue 10 timeout=30s badparam=1;"), 0,
+	'queue N timeout=T <unknown param>=...: rejected');
 isnt(conf_test("queue 10; queue 20;"), 0, 'queue given twice: rejected');
 
 # queue_detect_all_peer_down reads state (peer.data laid out as

@@ -9,6 +9,7 @@ typedef struct {
     ngx_flag_t reentered;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
+    ngx_msec_t retry_interval;
     ngx_uint_t max;
     ngx_uint_t size;
     ngx_queue_t queue;
@@ -39,11 +40,12 @@ static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_c
      * was empty/unhealthy (e.g. a `resolve` server before its first
      * successful DNS answer) would otherwise just sit until its own
      * queue timeout, even after a peer becomes selectable again. This
-     * timer re-tries periodically instead; it re-arms itself only
-     * while the queue is still non-empty, so an idle upstream never
-     * gets a lingering wakeup.
+     * timer re-tries periodically instead, every retry_interval (the
+     * "queue" directive's retry_interval= param, default 200ms); it
+     * re-arms itself only while the queue is still non-empty, so an
+     * idle upstream never gets a lingering wakeup.
      */
-    ngx_add_timer(&qscf->retry, 200);
+    ngx_add_timer(&qscf->retry, qscf->retry_interval);
 }
 
 static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
@@ -314,6 +316,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init_upstream(ngx_conf_t *cf, ngx_
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
     ngx_conf_init_value(qscf->detect, 0);
     ngx_conf_init_msec_value(qscf->timeout, 60000);
+    ngx_conf_init_msec_value(qscf->retry_interval, 200);
     if (qscf->peer.init_upstream(cf, uscf) != NGX_OK) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "init_upstream != NGX_OK"); return NGX_ERROR; }
     qscf->peer.init = uscf->peer.init;
     uscf->peer.init = ngx_http_upstream_queue_peer_init;
@@ -326,6 +329,7 @@ static void *ngx_http_upstream_queue_create_srv_conf(ngx_conf_t *cf) {
     if (!(conf = ngx_pcalloc(cf->pool, sizeof(*conf)))) return NULL;
     conf->detect = NGX_CONF_UNSET;
     conf->timeout = NGX_CONF_UNSET_MSEC;
+    conf->retry_interval = NGX_CONF_UNSET_MSEC;
     return conf;
 }
 
@@ -336,13 +340,27 @@ static char *ngx_http_upstream_queue_ups_conf(ngx_conf_t *cf, ngx_command_t *cmd
     ngx_int_t n = ngx_atoi(value[1].data, value[1].len);
     if (n == NGX_ERROR || !n) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid value \"%V\" in \"%V\" directive", &value[1], &cmd->name); return NGX_CONF_ERROR; }
     qscf->max = n;
-    if (cf->args->nelts > 2) {
-        if (value[2].len <= sizeof("timeout=") - 1 || ngx_strncmp(value[2].data, (u_char *)"timeout=", sizeof("timeout=") - 1)) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid name \"%V\" in \"%V\" directive", &value[2], &cmd->name); return NGX_CONF_ERROR; }
-        value[2].data += sizeof("timeout=") - 1;
-        value[2].len -= sizeof("timeout=") - 1;
-        ngx_int_t timeout = ngx_parse_time(&value[2], 0);
-        if (timeout == NGX_ERROR) return "ngx_parse_time == NGX_ERROR";
-        qscf->timeout = (ngx_msec_t)timeout;
+    for (ngx_uint_t i = 2; i < cf->args->nelts; i++) {
+        if (value[i].len > sizeof("timeout=") - 1 && !ngx_strncmp(value[i].data, (u_char *)"timeout=", sizeof("timeout=") - 1)) {
+            ngx_str_t s = value[i];
+            s.data += sizeof("timeout=") - 1;
+            s.len -= sizeof("timeout=") - 1;
+            ngx_int_t timeout = ngx_parse_time(&s, 0);
+            if (timeout == NGX_ERROR) return "ngx_parse_time == NGX_ERROR";
+            qscf->timeout = (ngx_msec_t)timeout;
+            continue;
+        }
+        if (value[i].len > sizeof("retry_interval=") - 1 && !ngx_strncmp(value[i].data, (u_char *)"retry_interval=", sizeof("retry_interval=") - 1)) {
+            ngx_str_t s = value[i];
+            s.data += sizeof("retry_interval=") - 1;
+            s.len -= sizeof("retry_interval=") - 1;
+            ngx_int_t interval = ngx_parse_time(&s, 0);
+            if (interval == NGX_ERROR || !interval) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid value \"%V\" in \"%V\" directive", &value[i], &cmd->name); return NGX_CONF_ERROR; }
+            qscf->retry_interval = (ngx_msec_t)interval;
+            continue;
+        }
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid name \"%V\" in \"%V\" directive", &value[i], &cmd->name);
+        return NGX_CONF_ERROR;
     }
     ngx_http_upstream_srv_conf_t *uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
     qscf->peer.init_upstream = uscf->peer.init_upstream ? uscf->peer.init_upstream : ngx_http_upstream_init_round_robin;
@@ -376,7 +394,7 @@ static ngx_http_module_t ngx_http_upstream_queue_ctx = {
 };
 
 static ngx_command_t ngx_http_upstream_queue_commands[] = {
-  { ngx_string("queue"), NGX_HTTP_UPS_CONF|NGX_CONF_TAKE12, ngx_http_upstream_queue_ups_conf, NGX_HTTP_SRV_CONF_OFFSET, 0, NULL },
+  { ngx_string("queue"), NGX_HTTP_UPS_CONF|NGX_CONF_TAKE123, ngx_http_upstream_queue_ups_conf, NGX_HTTP_SRV_CONF_OFFSET, 0, NULL },
   { ngx_string("queue_detect_all_peer_down"), NGX_HTTP_UPS_CONF|NGX_CONF_FLAG, ngx_conf_set_flag_slot, NGX_HTTP_SRV_CONF_OFFSET, .offset = offsetof(ngx_http_upstream_queue_srv_conf_t, detect), NULL },
     ngx_null_command
 };
