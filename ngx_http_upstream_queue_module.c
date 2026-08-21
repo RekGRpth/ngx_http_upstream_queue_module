@@ -130,6 +130,20 @@ static void ngx_http_upstream_queue_cleanup_handler(void *data) {
         ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
         ngx_queue_remove(&d->queue);
         qscf->size--;
+        /*
+         * A single request can register this cleanup handler more
+         * than once - each connect attempt that lands back in
+         * peer_get()'s "still busy, queue it" branch adds another
+         * ngx_pool_cleanup_t for the same d, e.g. on a retry after the
+         * request was already queued once. Without resetting d->queue
+         * to the self-referential "empty" state here (as
+         * ngx_http_upstream_queue_drain() already does after its own
+         * ngx_queue_remove()), a second invocation of this handler for
+         * the same d would see stale, dangling next/prev pointers,
+         * misread ngx_queue_empty() as false, and attempt a second,
+         * invalid removal through them.
+         */
+        ngx_queue_init(&d->queue);
     }
     if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
     if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
@@ -198,8 +212,22 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     d->timeout.handler = ngx_http_upstream_queue_timeout_handler;
     d->timeout.log = pc->log;
     ngx_add_timer(&d->timeout, qscf->timeout);
-    ngx_queue_insert_tail(&qscf->queue, &d->queue);
-    qscf->size++;
+    if (ngx_queue_empty(&d->queue)) {
+        /*
+         * Guard against linking an already-linked node: if something
+         * outside this module's own drain (e.g. nginx core retrying
+         * the same request's connect on its own) calls back in here
+         * while d is still sitting in qscf->queue from an earlier
+         * attempt, ngx_queue_insert_tail() on an already-linked node
+         * would corrupt the list - the same corruption that produced
+         * the ngx_queue_remove() crash fixed in the cleanup handler
+         * above. d->queue is only ever non-empty here because it is
+         * still genuinely queued, so it is already exactly where it
+         * needs to be; nothing to do.
+         */
+        ngx_queue_insert_tail(&qscf->queue, &d->queue);
+        qscf->size++;
+    }
     ngx_http_upstream_queue_retry_schedule(qscf);
     return NGX_AGAIN;
 }
