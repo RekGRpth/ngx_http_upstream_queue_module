@@ -12,6 +12,7 @@ typedef struct {
     ngx_uint_t max;
     ngx_uint_t size;
     ngx_queue_t queue;
+    ngx_event_t retry;
 } ngx_http_upstream_queue_srv_conf_t;
 
 typedef struct {
@@ -22,26 +23,42 @@ typedef struct {
     ngx_queue_t queue;
 } ngx_http_upstream_queue_data_t;
 
-static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
-    ngx_http_upstream_queue_data_t *d = data;
-    d->peer.free(pc, d->peer.data, state);
-    ngx_http_request_t *r = d->request;
-    ngx_http_upstream_t *u = r->upstream;
-    ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
-    ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
+static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e);
+static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t *d);
+
+static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_conf_t *qscf) {
+    if (ngx_queue_empty(&qscf->queue) || qscf->retry.timer_set) return;
+    qscf->retry.data = qscf;
+    qscf->retry.handler = ngx_http_upstream_queue_retry_handler;
+    qscf->retry.log = ngx_cycle->log;
+    qscf->retry.cancelable = 1;
+    /*
+     * Backstop for requests nothing else will ever wake: peer.free()
+     * only drains the queue when some *other* connection on this
+     * upstream is released, so a request queued because the peer set
+     * was empty/unhealthy (e.g. a `resolve` server before its first
+     * successful DNS answer) would otherwise just sit until its own
+     * queue timeout, even after a peer becomes selectable again. This
+     * timer re-tries periodically instead; it re-arms itself only
+     * while the queue is still non-empty, so an idle upstream never
+     * gets a lingering wakeup.
+     */
+    ngx_add_timer(&qscf->retry, 200);
+}
+
+static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
     while (!ngx_queue_empty(&qscf->queue)) {
         ngx_queue_t *q = ngx_queue_head(&qscf->queue);
         ngx_queue_remove(q);
         qscf->size--;
-        d = ngx_queue_data(q, ngx_http_upstream_queue_data_t, queue);
+        ngx_http_upstream_queue_data_t *d = ngx_queue_data(q, ngx_http_upstream_queue_data_t, queue);
         if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
         if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
         ngx_queue_init(&d->queue);
-        r = d->request;
-        u = r->upstream;
+        ngx_http_request_t *r = d->request;
+        ngx_http_upstream_t *u = r->upstream;
         ngx_connection_t *c = u->peer.connection;
         ngx_close_connection(c);
         c->shared = 0;
@@ -63,6 +80,45 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
         if (!qscf->reentered) break;
     }
     qscf->draining = 0;
+}
+
+static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, "queue retry");
+    ngx_http_upstream_queue_srv_conf_t *qscf = e->data;
+    if (!ngx_queue_empty(&qscf->queue)) {
+        /*
+         * Unlike peer_free()'s drain, nothing here guarantees a slot
+         * actually freed up - this fires on a plain timer. Popping the
+         * head and reconnecting unconditionally (as peer_free() safely
+         * does, because it is only called right after a slot really
+         * did free up) would, on every tick where nothing changed,
+         * requeue the head request at the tail with fresh timers -
+         * breaking FIFO order and resetting its deadline for no reason.
+         * So probe the underlying peer first, with a clean rollback,
+         * and only actually touch the queue when it would truly
+         * succeed.
+         */
+        ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
+        ngx_http_upstream_queue_refresh_peer(d);
+        ngx_peer_connection_t probe;
+        ngx_memzero(&probe, sizeof(ngx_peer_connection_t));
+        probe.log = e->log;
+        if (d->peer.get(&probe, d->peer.data) == NGX_OK) {
+            d->peer.free(&probe, d->peer.data, 0);
+            ngx_http_upstream_queue_drain(qscf);
+        }
+    }
+    ngx_http_upstream_queue_retry_schedule(qscf);
+}
+
+static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
+    ngx_http_upstream_queue_data_t *d = data;
+    d->peer.free(pc, d->peer.data, state);
+    ngx_http_upstream_t *u = d->request->upstream;
+    ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
+    ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
+    ngx_http_upstream_queue_drain(qscf);
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
@@ -144,6 +200,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_add_timer(&d->timeout, qscf->timeout);
     ngx_queue_insert_tail(&qscf->queue, &d->queue);
     qscf->size++;
+    ngx_http_upstream_queue_retry_schedule(qscf);
     return NGX_AGAIN;
 }
 
@@ -158,6 +215,39 @@ static void ngx_http_upstream_queue_peer_save_session(ngx_peer_connection_t *pc,
     d->peer.save_session(pc, d->peer.data);
 }
 #endif
+
+static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t *d) {
+    /*
+     * d->peer.data is a round-robin ngx_http_upstream_rr_peer_data_t
+     * captured once, when this request first started. Its ->config
+     * field is a snapshot of the upstream's peer-set generation taken
+     * at that moment; ngx_http_upstream_get_round_robin_peer() treats
+     * any mismatch against the *current* generation as permanently
+     * busy for that snapshot, no matter how many times it is retried
+     * (see its "rrp->config != *peers->config" check) - and a
+     * `resolve` server bumps that generation the moment DNS adds or
+     * removes an address. So a request that queued before such a
+     * change can never succeed on its original snapshot; re-running
+     * the wrapped peer.init refreshes rrp->config (and rrp->tried) in
+     * place before every retry, exactly as a brand new request would
+     * get a current snapshot.
+     */
+    ngx_http_request_t *r = d->request;
+    ngx_http_upstream_t *u = r->upstream;
+    ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
+    ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
+    u->peer.data = d->peer.data;
+    if (qscf->peer.init(r, uscf) == NGX_OK) {
+        d->peer = u->peer;
+    }
+    u->peer.data = d;
+    u->peer.get = ngx_http_upstream_queue_peer_get;
+    u->peer.free = ngx_http_upstream_queue_peer_free;
+#if (NGX_HTTP_SSL)
+    u->peer.save_session = ngx_http_upstream_queue_peer_save_session;
+    u->peer.set_session = ngx_http_upstream_queue_peer_set_session;
+#endif
+}
 
 static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *uscf) {
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "%s", __func__);
