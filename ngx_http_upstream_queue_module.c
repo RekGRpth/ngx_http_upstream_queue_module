@@ -224,6 +224,7 @@ static ngx_int_t ngx_http_upstream_queue_postconfiguration(ngx_conf_t *cf) {
     ngx_http_upstream_main_conf_t *umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
     ngx_http_upstream_srv_conf_t **uscfp = umcf->upstreams.elts;
     for (ngx_uint_t i = 0; i < umcf->upstreams.nelts; i++) {
+        if (!uscfp[i]->srv_conf) continue;
         ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscfp[i], ngx_http_upstream_queue_module);
         if (qscf->detect == 1 && !qscf->max) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "\"queue_detect_all_peer_down\" is specified without \"queue\" in upstream \"%V\"", &uscfp[i]->host);
