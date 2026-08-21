@@ -57,6 +57,18 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
         if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
         ngx_queue_init(&d->queue);
+        /*
+         * Refresh this request's round-robin snapshot before retrying
+         * it, not just when the retry timer's own probe does it: this
+         * drain loop also runs directly from peer_free() whenever some
+         * other connection on the upstream genuinely frees a slot, and
+         * without refreshing here, a request whose snapshot went stale
+         * while queued (e.g. a `resolve` server's peer set changed)
+         * would still see a false BUSY on that real opportunity and
+         * just get silently re-queued, waiting for the next timer tick
+         * to fix what a real free-event should have fixed immediately.
+         */
+        ngx_http_upstream_queue_refresh_peer(d);
         ngx_http_request_t *r = d->request;
         ngx_http_upstream_t *u = r->upstream;
         ngx_connection_t *c = u->peer.connection;
