@@ -2,28 +2,24 @@
 
 # Regression test for ngx_http_upstream_queue_module.
 #
-# When a connection frees a slot, ngx_http_upstream_queue_drain() pops the
-# head of the queue and reconnects it.  That request can find no peer it
-# may use - e.g. the freed slot is on a peer it has already tried - and go
-# straight back into the queue, leaving the slot free.  drain() used to
-# stop there anyway, so a request further back that could have taken the
-# slot waited for the next retry timer tick (or some other free) instead.
+# When ngx_http_upstream_get_round_robin_peer() finds no primary peer it
+# switches the request's rrp->peers to the backup set (clearing
+# rrp->tried), and leaves it there when the backup set has nothing free
+# either - harmless in nginx itself, where NGX_BUSY ends the request.  A
+# queued request is retried later, though, so before each retry the
+# module has to re-run the balancer's peer.init: skipping that left the
+# request looking at the backup set only, never at a primary peer that
+# had freed up, until the queue timeout.
 #
 # Layout:
-#   - peer A: nothing listens at first, max_conns=1, max_fails=0;
-#   - peer B: a backend that accepts one connection and holds it, then
-#     stops listening; max_conns=1;
-#   - retry_interval=5s, so the timer can't hide the difference;
-#   - a holder request is refused by A and ends up holding B;
-#   - R1 is refused by A as well (A is now in R1's rrp->tried) and
-#     queues;
-#   - A comes up, answering each request after 1s; T takes A's slot;
-#   - R2 queues behind R1 while A and B are both busy.
+#   - primary peer A, max_conns=1: the first request is held 1s and then
+#     answered, later ones are answered at once;
+#   - backup peer C, max_conns=1: holds every connection;
+#   - H1 takes A, H2 (finding A busy) takes C, R finds both busy and
+#     queues.
 #
-# When T finishes and frees A, R1 (at the head) can't use A and queues
-# again.  Expected: R2, which can, gets A right then - answered about 2s
-# after it was sent, not only once the holder lets B go or the retry
-# timer fires, ~5s in.
+# Expected: R gets A once H1 is done with it, about 1s in - not a 504 at
+# the 3s queue timeout.
 
 ###############################################################################
 
@@ -61,7 +57,7 @@ my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(3);
 # so the servers are written with their raw numbers below.
 
 my $a_port = port(8081);
-my $b_port = port(8082);
+my $c_port = port(8082);
 
 $t->write_file_expand('nginx.conf', <<"EOF");
 
@@ -79,9 +75,9 @@ http {
     %%TEST_GLOBALS_HTTP%%
 
     upstream backend {
-        server 127.0.0.1:8081 max_conns=1 max_fails=0;
-        server 127.0.0.1:8082 max_conns=1 max_fails=0;
-        queue 5 timeout=10s retry_interval=5s;
+        server 127.0.0.1:8081 max_conns=1;
+        server 127.0.0.1:8082 max_conns=1 backup;
+        queue 5 timeout=3s;
     }
 
     server {
@@ -97,42 +93,34 @@ http {
 
 EOF
 
-$t->run_daemon(\&hold_backend, $b_port);
-$t->waitforsocket('127.0.0.1:' . $b_port)
-	or die "backend B did not start\n";
+$t->run_daemon(\&primary_backend, $a_port);
+$t->run_daemon(\&backup_backend, $c_port);
+$t->waitforsocket('127.0.0.1:' . $a_port)
+	or die "backend A did not start\n";
+$t->waitforsocket('127.0.0.1:' . $c_port)
+	or die "backend C did not start\n";
 
 $t->run();
 
 ###############################################################################
 
-my $holder = send_request('/holder');
-select(undef, undef, undef, 0.3);
+my $h1 = send_request('/H1');
+select(undef, undef, undef, 0.2);
 
-my $r1 = send_request('/R1');
-select(undef, undef, undef, 0.3);
-
-$t->run_daemon(\&slow_backend, $a_port);
-$t->waitforsocket('127.0.0.1:' . $a_port)
-	or die "backend A did not start\n";
-
-my $tr = send_request('/T');
+my $h2 = send_request('/H2');
 select(undef, undef, undef, 0.2);
 
 my $start = time();
-my $r2 = send_request('/R2');
-
-my $tresp = read_response($tr, 5);
-my $resp = read_response($r2, 10);
+my $r = send_request('/R');
+my $resp = read_response($r, 6);
 my $elapsed = time() - $start;
 
-like($tresp, qr!^HTTP/1\.[01] 200 !, 'T is served by A');
-like($resp, qr!^HTTP/1\.[01] 200 !, 'R2 is served')
+like(read_response($h1, 5), qr!^HTTP/1\.[01] 200 !, 'H1 is served by A');
+like($resp, qr!^HTTP/1\.[01] 200 !,
+	'queued request gets the primary peer once it frees up')
 	or diag($resp =~ /^([^\r\n]*)/ ? $1 : '(no response)');
-ok($elapsed < 3, 'R2 gets the slot T frees, even though R1 ahead of it '
-	. 'cannot use it') or diag("elapsed: $elapsed");
-
-read_response($r1, 10);
-read_response($holder, 10);
+ok($elapsed < 2, 'served when A frees up, not at the queue timeout')
+	or diag("elapsed: $elapsed");
 
 ###############################################################################
 
@@ -170,7 +158,7 @@ sub read_response {
 	return $resp;
 }
 
-sub hold_backend {
+sub primary_backend {
 	my ($port) = @_;
 
 	my $server = IO::Socket::INET->new(
@@ -180,43 +168,38 @@ sub hold_backend {
 		Reuse => 1,
 	) or die "Can't create backend listening socket: $!\n";
 
-	# The first connection is waitforsocket()'s own probe.
-
-	$server->accept()->close();
-
-	my $client = $server->accept()
-		or die "Can't accept backend connection: $!\n";
-
-	$server->close();
-
-	select(undef, undef, undef, 5);
-
-	$client->close();
-
-	exit 0;
-}
-
-sub slow_backend {
-	my ($port) = @_;
-
-	my $server = IO::Socket::INET->new(
-		Proto => 'tcp',
-		LocalAddr => "127.0.0.1:$port",
-		Listen => 5,
-		Reuse => 1,
-	) or die "Can't create backend listening socket: $!\n";
+	my $first = 1;
 
 	while (my $client = $server->accept()) {
 
 		# waitforsocket()'s probe sends nothing and just closes.
 
-		if ($client->sysread(my $buf, 65536)) {
+		next unless $client->sysread(my $buf, 65536);
+
+		if ($first) {
+			$first = 0;
 			select(undef, undef, undef, 1);
-			$client->syswrite(
-				"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
 		}
 
+		$client->syswrite("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
 		$client->close();
+	}
+}
+
+sub backup_backend {
+	my ($port) = @_;
+
+	my $server = IO::Socket::INET->new(
+		Proto => 'tcp',
+		LocalAddr => "127.0.0.1:$port",
+		Listen => 5,
+		Reuse => 1,
+	) or die "Can't create backend listening socket: $!\n";
+
+	my @held;
+
+	while (my $client = $server->accept()) {
+		push @held, $client;
 	}
 }
 

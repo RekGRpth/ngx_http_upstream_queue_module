@@ -3,8 +3,9 @@
 # Regression test for ngx_http_upstream_queue_module.
 #
 # ngx_http_upstream_queue_refresh_peer() re-runs the balancer's peer.init
-# on a queued request so its round-robin snapshot catches up with a
-# `resolve` server's peer set.  peer.init is written for a brand new
+# on a queued request before every retry, so it starts over from a clean,
+# current state (see queue_backup.t for why).  peer.init is written for a
+# brand new
 # request: it resets u->peer.tries to the full peer count and clears the
 # rrp->tried bitmap.  Run on a request that has already failed some
 # attempts, that hands it a fresh retry budget - proxy_next_upstream_tries
@@ -17,7 +18,7 @@
 # until the queue timeout finally answers 504.
 #
 # Layout, run once for a static upstream and once for one with a
-# `resolve` server (the only case where a refresh is still needed):
+# `resolve` server:
 #   - peer A: a backend that accepts exactly one connection and then
 #     stops listening; max_conns=1;
 #   - peer B: a closed port, every connect is refused;
@@ -26,19 +27,19 @@
 #   - a holder request takes A's only slot, unanswered;
 #   - request R then fails on B (attempt 1), finds A busy and queues.
 #
-# Expected: R makes exactly one more attempt (on A once the holder lets
-# go, or on B again after a resolve refresh) and then gets a 502 - two
+# Expected: R makes exactly one more attempt (on B again after a refresh
+# clears rrp->tried, or on A if the holder lets go first) and then gets a
+# 502 - two
 # attempts in total, as proxy_next_upstream_tries says.  Counted from
 # $upstream_addr, ignoring the upstream-name entries a queued connect
 # leaves behind.
 #
-# Not refreshing static upstreams at all broke the retry timer, though:
-# its probe calls peer.get(), which marks the peer it picks in the
-# request's rrp->tried, and the refresh inside drain() used to be what
-# cleared that mark again.  Without it, drain() could not pick the very
-# peer the probe had just found free, so the request queued again and
-# every later probe came back BUSY until the queue timeout.  The last
-# scenario covers that: peer A of a static upstream fails and is
+# The retry timer's probe needs a refresh after it as well: it calls
+# peer.get(), which marks the peer it picks in the request's rrp->tried.
+# Left there, drain() could not pick the very peer the probe had just
+# found free, so the request queued again and every later probe came
+# back BUSY until the queue timeout.  The last scenario covers that:
+# peer A of a static upstream fails and is
 # disabled for fail_timeout=1s (the other peer is "down"), R queues,
 # A comes back up - and R must be served once fail_timeout is over,
 # not answered with 504 at the queue timeout.
