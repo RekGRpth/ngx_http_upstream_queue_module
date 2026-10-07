@@ -24,6 +24,8 @@ typedef struct {
     ngx_peer_connection_t peer;
     ngx_queue_t queue;
     ngx_uint_t used;
+    ngx_flag_t deadline_set;
+    ngx_msec_t deadline;
 } ngx_http_upstream_queue_data_t;
 
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e);
@@ -202,7 +204,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_http_upstream_queue_data_t *d = data;
     ngx_int_t rc = d->peer.get(pc, d->peer.data);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
-    if (rc != NGX_BUSY) return rc;
+    if (rc != NGX_BUSY) { d->deadline_set = 0; return rc; }
     ngx_http_request_t *r = d->request;
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
@@ -245,7 +247,20 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     d->timeout.data = r;
     d->timeout.handler = ngx_http_upstream_queue_timeout_handler;
     d->timeout.log = pc->log;
-    ngx_add_timer(&d->timeout, qscf->timeout);
+    /*
+     * A request that drain() pops and reconnects can find no peer again
+     * and land back here, e.g. when the slot that freed up is on a peer
+     * it has already tried. Keep the deadline it got when it started
+     * waiting rather than a fresh timeout each round, or frees on such
+     * peers could keep it queued well past the timeout. Only a peer
+     * actually selected (above) starts a new wait.
+     */
+    if (!d->deadline_set) {
+        d->deadline = ngx_current_msec + qscf->timeout;
+        d->deadline_set = 1;
+    }
+    ngx_msec_int_t left = (ngx_msec_int_t) (d->deadline - ngx_current_msec);
+    ngx_add_timer(&d->timeout, left > 0 ? (ngx_msec_t) left : 0);
     if (ngx_queue_empty(&d->queue)) {
         /*
          * Guard against linking an already-linked node: if something
