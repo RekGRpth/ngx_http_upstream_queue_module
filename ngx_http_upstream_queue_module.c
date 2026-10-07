@@ -405,15 +405,17 @@ static char *ngx_http_upstream_queue_ups_conf(ngx_conf_t *cf, ngx_command_t *cmd
     qscf->max = n;
     for (ngx_uint_t i = 2; i < cf->args->nelts; i++) {
         if (value[i].len > sizeof("timeout=") - 1 && !ngx_strncmp(value[i].data, (u_char *)"timeout=", sizeof("timeout=") - 1)) {
+            if (qscf->timeout != NGX_CONF_UNSET_MSEC) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "duplicate parameter \"%V\" in \"%V\" directive", &value[i], &cmd->name); return NGX_CONF_ERROR; }
             ngx_str_t s = value[i];
             s.data += sizeof("timeout=") - 1;
             s.len -= sizeof("timeout=") - 1;
             ngx_int_t timeout = ngx_parse_time(&s, 0);
-            if (timeout == NGX_ERROR) return "ngx_parse_time == NGX_ERROR";
+            if (timeout == NGX_ERROR || !timeout) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid value \"%V\" in \"%V\" directive", &value[i], &cmd->name); return NGX_CONF_ERROR; }
             qscf->timeout = (ngx_msec_t)timeout;
             continue;
         }
         if (value[i].len > sizeof("retry_interval=") - 1 && !ngx_strncmp(value[i].data, (u_char *)"retry_interval=", sizeof("retry_interval=") - 1)) {
+            if (qscf->retry_interval != NGX_CONF_UNSET_MSEC) { ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "duplicate parameter \"%V\" in \"%V\" directive", &value[i], &cmd->name); return NGX_CONF_ERROR; }
             ngx_str_t s = value[i];
             s.data += sizeof("retry_interval=") - 1;
             s.len -= sizeof("retry_interval=") - 1;

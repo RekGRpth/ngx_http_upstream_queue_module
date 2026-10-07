@@ -38,7 +38,7 @@ if (!-x $nginx || !-e $module) {
 my $testdir = tempdir('nginx-queue-directive-XXXXXXXXXX', TMPDIR => 1,
 	CLEANUP => 1);
 
-plan(tests => 22);
+plan(tests => 26);
 
 is(conf_test("queue 10;"), 0, 'queue N: valid, minimal form');
 is(conf_test("queue 10 timeout=30s;"), 0, 'queue N timeout=T: valid form');
@@ -56,6 +56,13 @@ isnt(conf_test("queue -5;"), 0, 'queue <negative>: rejected');
 isnt(conf_test("queue 10 timeout=;"), 0, 'queue N timeout=<empty>: rejected');
 isnt(conf_test("queue 10 timeout=abc;"), 0,
 	'queue N timeout=<not a time>: rejected');
+like(read_conftest_log(), qr/invalid value "timeout=abc" in "queue" directive/,
+	'queue N timeout=<not a time>: says which value is wrong');
+isnt(conf_test("queue 10 timeout=0;"), 0, 'queue N timeout=0: rejected');
+isnt(conf_test("queue 10 timeout=1s timeout=5s;"), 0,
+	'queue N timeout given twice: rejected');
+isnt(conf_test("queue 10 retry_interval=1s retry_interval=5s;"), 0,
+	'queue N retry_interval given twice: rejected');
 isnt(conf_test("queue 10 retry_interval=;"), 0,
 	'queue N retry_interval=<empty>: rejected');
 isnt(conf_test("queue 10 retry_interval=abc;"), 0,
@@ -155,6 +162,12 @@ EOF
 		. ">$testdir/conftest.log 2>&1");
 
 	return $? >> 8;
+}
+
+sub read_conftest_log {
+	open my $fh, '<', "$testdir/conftest.log" or return '';
+	local $/;
+	return <$fh>;
 }
 
 # Runs "nginx -t" against a location that proxy_passes straight to a unix
