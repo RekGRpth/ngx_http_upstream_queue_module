@@ -7,6 +7,7 @@ typedef struct {
     ngx_flag_t detect;
     ngx_flag_t draining;
     ngx_flag_t reentered;
+    ngx_flag_t requeued;
     ngx_flag_t resolve;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
@@ -55,7 +56,9 @@ static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_c
 static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
-    while (!ngx_queue_empty(&qscf->queue)) {
+    /* each request queued on entry gets at most one try per pass */
+    ngx_uint_t pass = qscf->size;
+    while (!ngx_queue_empty(&qscf->queue) && pass--) {
         ngx_queue_t *q = ngx_queue_head(&qscf->queue);
         ngx_queue_remove(q);
         qscf->size--;
@@ -88,6 +91,7 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         ngx_close_connection(c);
         c->shared = 0;
         qscf->reentered = 0;
+        qscf->requeued = 0;
         /*
          * Don't touch r/u after this call: if the connect fails
          * synchronously with no tries left, it finalizes the request
@@ -97,13 +101,16 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         /*
          * ngx_http_upstream_connect() only re-enters this function
          * (caught above via draining) when the just-dequeued request's
-         * connect fails synchronously. Anything else - a real connect
-         * left in progress, or one that succeeded outright - means the
-         * peer slot this drain pass freed up is now spoken for again;
+         * connect fails synchronously, and only lands back in peer_get()'s
+         * queueing branch (requeued) when that request found no peer it
+         * may use - e.g. the freed slot is on a peer it has already
+         * tried. Either way the slot is still free: offer it to the next
+         * one. Anything else - a real connect left in progress, or one
+         * that succeeded outright - means the slot is spoken for again;
          * further queued requests must wait for their own turn instead
          * of being popped speculatively.
          */
-        if (!qscf->reentered) break;
+        if (!qscf->reentered && !qscf->requeued) break;
     }
     qscf->draining = 0;
 }
@@ -277,6 +284,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
         ngx_queue_insert_tail(&qscf->queue, &d->queue);
         qscf->size++;
     }
+    qscf->requeued = 1;
     ngx_http_upstream_queue_retry_schedule(qscf);
     return NGX_AGAIN;
 }
