@@ -31,6 +31,17 @@
 # attempts in total, as proxy_next_upstream_tries says.  Counted from
 # $upstream_addr, ignoring the upstream-name entries a queued connect
 # leaves behind.
+#
+# Not refreshing static upstreams at all broke the retry timer, though:
+# its probe calls peer.get(), which marks the peer it picks in the
+# request's rrp->tried, and the refresh inside drain() used to be what
+# cleared that mark again.  Without it, drain() could not pick the very
+# peer the probe had just found free, so the request queued again and
+# every later probe came back BUSY until the queue timeout.  The last
+# scenario covers that: peer A of a static upstream fails and is
+# disabled for fail_timeout=1s (the other peer is "down"), R queues,
+# A comes back up - and R must be served once fail_timeout is over,
+# not answered with 504 at the queue timeout.
 
 ###############################################################################
 
@@ -69,6 +80,7 @@ my $t = Test::Nginx->new()->has(qw/http proxy upstream_zone/);
 
 my $static_port = port(8081);
 my $resolve_port = port(8083);
+my $probe_port = port(8084);
 my $dns_port = port(8982, udp => 1);
 
 $t->write_file_expand('nginx.conf', <<"EOF");
@@ -102,6 +114,12 @@ http {
         queue 5 timeout=5s;
     }
 
+    upstream probe_backend {
+        server 127.0.0.1:8084 max_fails=1 fail_timeout=1s;
+        server 127.0.0.1:8085 down;
+        queue 5 timeout=4s;
+    }
+
     server {
         listen       127.0.0.1:8080;
         server_name  localhost;
@@ -120,6 +138,10 @@ http {
         location /resolve/ {
             proxy_pass http://resolve_backend;
         }
+
+        location /probe/ {
+            proxy_pass http://probe_backend;
+        }
     }
 }
 
@@ -131,7 +153,7 @@ $t->run_daemon(\&hold_backend, $resolve_port);
 $t->waitforfile($t->testdir() . '/dns_ready')
 	or die "dns daemon did not start\n";
 
-$t->try_run('no resolve/zone support')->plan(4);
+$t->try_run('no resolve/zone support')->plan(6);
 
 ###############################################################################
 
@@ -152,6 +174,27 @@ is($status, 502, 'resolve upstream: queued request ends with 502')
 	or diag("X-Upstream-Addr: $addr");
 is($attempts, 2, 'resolve upstream: proxy_next_upstream_tries 2 respected '
 	. 'across snapshot refreshes') or diag("X-Upstream-Addr: $addr");
+
+# Peer A is not listening yet: X fails on it and disables it for 1s.
+
+read_response(send_request('/probe/X'), 5);
+
+my $start = time();
+my $s = send_request('/probe/R');
+
+# R is queued now; bring A up while it waits out fail_timeout.
+
+select(undef, undef, undef, 0.2);
+$t->run_daemon(\&ok_backend, $probe_port);
+
+my $resp = read_response($s, 8);
+my $elapsed = time() - $start;
+
+like($resp, qr!^HTTP/1\.[01] 200 !,
+	'retry probe: queued request is served once the peer is back')
+	or diag($resp =~ /^([^\r\n]*)/ ? $1 : '(no response)');
+ok($elapsed < 3, 'retry probe: served after fail_timeout, not at the '
+	. 'queue timeout') or diag("elapsed: $elapsed");
 
 ###############################################################################
 
@@ -236,6 +279,23 @@ sub hold_backend {
 	$client->close();
 
 	exit 0;
+}
+
+sub ok_backend {
+	my ($port) = @_;
+
+	my $server = IO::Socket::INET->new(
+		Proto => 'tcp',
+		LocalAddr => "127.0.0.1:$port",
+		Listen => 5,
+		Reuse => 1,
+	) or die "Can't create backend listening socket: $!\n";
+
+	while (my $client = $server->accept()) {
+		$client->sysread(my $buf, 65536);
+		$client->syswrite("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+		$client->close();
+	}
 }
 
 # Minimal mock DNS server: example.net always resolves to 127.0.0.1 - see
