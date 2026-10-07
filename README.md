@@ -24,6 +24,8 @@ The retry_interval parameter controls how often a queued request is re-checked w
 
 When using load balancer methods other than the default round-robin method, it is necessary to activate them before the queue directive.
 
+The keepalive directive, if any, must come after the queue directive on nginx before 1.29.7 and on forks such as freenginx and Angie, where keepalive takes effect at the point it is declared; `nginx -t` rejects the other order there. Since 1.29.7 nginx sets keepalive up after all other upstream directives, so either order works.
+
 queue_detect_all_peer_down;
 -------------
 * Syntax: queue_detect_all_peer_down on | off;

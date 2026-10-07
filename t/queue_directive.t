@@ -38,7 +38,7 @@ if (!-x $nginx || !-e $module) {
 my $testdir = tempdir('nginx-queue-directive-XXXXXXXXXX', TMPDIR => 1,
 	CLEANUP => 1);
 
-plan(tests => 20);
+plan(tests => 22);
 
 is(conf_test("queue 10;"), 0, 'queue N: valid, minimal form');
 is(conf_test("queue 10 timeout=30s;"), 0, 'queue N timeout=T: valid form');
@@ -78,6 +78,27 @@ is(conf_test("queue 10; queue_detect_all_peer_down on;"), 0,
 	'queue_detect_all_peer_down on with queue: valid');
 is(conf_test("queue_detect_all_peer_down off;"), 0,
 	'queue_detect_all_peer_down off without queue: valid (default anyway)');
+
+# Where "keepalive" wraps the balancer as soon as it is parsed (nginx
+# before 1.29.7, freenginx, Angie), declaring it before "queue" would
+# leave queue wrapping keepalive instead of the balancer, so that order
+# is rejected there.  Newer nginx sets keepalive up after all directives,
+# outside of queue, and accepts either order.
+
+my ($nginx_name, $nginx_ver) = `$nginx -v 2>&1` =~ m!version: (\S+?)/(\d+\.\d+\.\d+)!;
+my $late_keepalive = $nginx_name eq 'nginx' && $nginx_ver
+	&& sprintf('%03d%03d%03d', split /\./, $nginx_ver) ge '001029007';
+
+is(conf_test("queue 10; keepalive 4;"), 0,
+	'queue before keepalive: valid');
+
+if ($late_keepalive) {
+	is(conf_test("keepalive 4; queue 10;"), 0,
+		"keepalive before queue: valid on $nginx_name/$nginx_ver");
+} else {
+	isnt(conf_test("keepalive 4; queue 10;"), 0,
+		"keepalive before queue: rejected on $nginx_name/$nginx_ver");
+}
 
 # postconfiguration walks every upstream in umcf->upstreams, including
 # implicit ones nginx creates for a bare "proxy_pass" that never went

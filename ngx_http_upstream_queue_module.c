@@ -426,6 +426,26 @@ static char *ngx_http_upstream_queue_ups_conf(ngx_conf_t *cf, ngx_command_t *cmd
         return NGX_CONF_ERROR;
     }
     ngx_http_upstream_srv_conf_t *uscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_upstream_module);
+    /*
+     * Where keepalive wraps the balancer as soon as its directive is
+     * parsed (nginx before 1.29.7, freenginx, Angie - its module has no
+     * init_main_conf there), "keepalive" before "queue" would leave
+     * queue wrapping keepalive instead of the balancer: queue would
+     * treat keepalive's peer data as round-robin's, and the retry
+     * probe would strand a cached connection on NGX_DONE. Newer nginx
+     * sets keepalive up after all directives, outside of queue, so
+     * either order works there. Looked up by name: referencing the
+     * symbol would stop the module loading into an nginx built
+     * without keepalive.
+     */
+    for (ngx_uint_t i = 0; cf->cycle->modules[i]; i++) {
+        ngx_module_t *m = cf->cycle->modules[i];
+        if (m->type != NGX_HTTP_MODULE || ngx_strcmp(m->name, "ngx_http_upstream_keepalive_module")) continue;
+        ngx_http_module_t *ctx = m->ctx;
+        ngx_uint_t *max_cached = uscf->srv_conf[m->ctx_index];
+        if (!ctx->init_main_conf && *max_cached) return "must be specified before \"keepalive\"";
+        break;
+    }
     qscf->peer.init_upstream = uscf->peer.init_upstream ? uscf->peer.init_upstream : ngx_http_upstream_init_round_robin;
     uscf->peer.init_upstream = ngx_http_upstream_queue_peer_init_upstream;
     return NGX_CONF_OK;
