@@ -1,14 +1,20 @@
 ngx_addon_name=ngx_http_upstream_queue_module
 
-NGX_HTTP_UPSTREAM_QUEUE_SRCS=$ngx_addon_dir/ngx_http_upstream_queue_module.c
+if test "$ngx_module_link" != DYNAMIC; then
 
-if test -n "$ngx_module_link"; then
-    ngx_module_name=$ngx_addon_name
-    ngx_module_srcs=$NGX_HTTP_UPSTREAM_QUEUE_SRCS
-    ngx_module_type=HTTP
+cat << END
 
-    . auto/module
-else
-    HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
-    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $NGX_HTTP_UPSTREAM_QUEUE_SRCS"
+$0: error: $ngx_addon_name can only be built as a dynamic
+module: it includes src/http/ngx_http_upstream.c, so linking it into
+nginx defines that file's symbols twice.  Use --add-dynamic-module
+instead of --add-module.
+
+END
+    exit 1
 fi
+
+ngx_module_name=$ngx_addon_name
+ngx_module_srcs=$ngx_addon_dir/ngx_http_upstream_queue_module.c
+ngx_module_type=HTTP
+
+. auto/module

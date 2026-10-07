@@ -1,5 +1,13 @@
 # Nginx upstream queue
 
+# Build
+
+The module includes nginx's own `src/http/ngx_http_upstream.c` to reach functions that nginx keeps static, so it can only be built as a dynamic module:
+
+    ./configure --add-dynamic-module=/path/to/ngx_http_upstream_queue_module
+
+and loaded with `load_module modules/ngx_http_upstream_queue_module.so;`. `--add-module` is rejected by configure: linked into nginx statically, the module would define that file's symbols a second time.
+
 # Directive
 
 queue
