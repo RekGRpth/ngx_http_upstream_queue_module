@@ -18,6 +18,13 @@
 # TEST_NGINX_VALGRIND=1 to start nginx under valgrind and fail on any
 # "Invalid read/write" it reports.  Without it, the test still checks every
 # queued client gets a clean 502 and nothing [alert]-level was logged.
+#
+# The same run also checks for a leak on that path: when peer_get() queues
+# a request it returns NGX_AGAIN with a placeholder connection, and
+# ngx_http_upstream_connect() gives that placeholder its own c->pool.
+# drain() used to close the placeholder without destroying that pool, so
+# each dequeued request leaked it - valgrind reports it as "definitely
+# lost", allocated from ngx_http_upstream_connect().
 
 ###############################################################################
 
@@ -53,7 +60,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(2);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(3);
 
 my $sockpath = $t->testdir() . '/backend.sock';
 
@@ -105,7 +112,7 @@ if ($valgrind) {
 	my $wrapper = $t->testdir() . '/valgrind.sh';
 	$t->write_file('valgrind.sh', <<"EOF");
 #!/bin/sh
-exec valgrind --quiet --log-file=@{[ $t->testdir() ]}/valgrind.%p.log $nginx "\$@"
+exec valgrind --quiet --leak-check=full --show-leak-kinds=definite --log-file=@{[ $t->testdir() ]}/valgrind.%p.log $nginx "\$@"
 EOF
 	chmod 0755, $wrapper;
 	$Test::Nginx::NGINX = $wrapper;
@@ -149,7 +156,7 @@ is($bad, 0, 'all ' . scalar(@socks) . ' clients got a complete 502');
 $t->stop();
 
 SKIP: {
-	skip 'set TEST_NGINX_VALGRIND=1 to check for invalid memory access', 1
+	skip 'set TEST_NGINX_VALGRIND=1 to check memory under valgrind', 2
 		unless $valgrind;
 
 	my $log = join '', map { $t->read_file($_) }
@@ -159,6 +166,17 @@ SKIP: {
 	unlike($log, qr/Invalid (read|write)/,
 		'valgrind: no invalid memory access in drain()')
 		or diag($log);
+
+	# Loss records are separated by bare "==pid== " lines.  Only count
+	# the ones allocated via ngx_http_upstream_connect(): nginx itself
+	# leaks a few unrelated bytes (e.g. ngx_set_environment()).
+
+	my @leaks = grep { /definitely lost/ && /ngx_http_upstream_connect/ }
+		split /^==\d+== *\n/m, $log;
+
+	is(scalar @leaks, 0,
+		'valgrind: no upstream connection pool leaked by drain()')
+		or diag(join '', @leaks);
 }
 
 ###############################################################################

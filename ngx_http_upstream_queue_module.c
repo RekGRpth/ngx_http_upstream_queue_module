@@ -74,6 +74,13 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         ngx_http_request_t *r = d->request;
         ngx_http_upstream_t *u = r->upstream;
         ngx_connection_t *c = u->peer.connection;
+        /*
+         * ngx_http_upstream_connect() gave this placeholder its own
+         * c->pool when peer_get() returned NGX_AGAIN; closing the
+         * connection doesn't free it, and ngx_get_connection() zeroes
+         * the slot on reuse, so destroy it here.
+         */
+        if (c->pool) ngx_destroy_pool(c->pool);
         ngx_close_connection(c);
         c->shared = 0;
         qscf->reentered = 0;
