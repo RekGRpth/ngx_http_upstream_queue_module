@@ -7,6 +7,7 @@ typedef struct {
     ngx_flag_t detect;
     ngx_flag_t draining;
     ngx_flag_t reentered;
+    ngx_flag_t resolve;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
     ngx_msec_t retry_interval;
@@ -22,6 +23,7 @@ typedef struct {
     ngx_http_request_t *request;
     ngx_peer_connection_t peer;
     ngx_queue_t queue;
+    ngx_uint_t used;
 } ngx_http_upstream_queue_data_t;
 
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e);
@@ -136,6 +138,7 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
 static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
     ngx_http_upstream_queue_data_t *d = data;
+    d->used++;
     d->peer.free(pc, d->peer.data, state);
     ngx_http_upstream_t *u = d->request->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
@@ -281,13 +284,27 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
      * the wrapped peer.init refreshes rrp->config (and rrp->tried) in
      * place before every retry, exactly as a brand new request would
      * get a current snapshot.
+     *
+     * Without a `resolve` server the generation never changes, so
+     * there is nothing to refresh - and re-running peer.init would
+     * only throw away this request's rrp->tried and retry budget.
      */
     ngx_http_request_t *r = d->request;
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
+    if (!qscf->resolve) return;
     u->peer.data = d->peer.data;
     if (qscf->peer.init(r, uscf) == NGX_OK) {
+        /*
+         * peer.init also resets u->peer.tries to the full peer count,
+         * as for a brand new request. Re-apply proxy_next_upstream_tries
+         * the way ngx_http_upstream_init_request() does, and take off
+         * the attempts this request has already made, so a queued
+         * request can't get a fresh retry budget on every refresh.
+         */
+        if (u->conf->next_upstream_tries && u->peer.tries > u->conf->next_upstream_tries) u->peer.tries = u->conf->next_upstream_tries;
+        u->peer.tries = u->peer.tries > d->used ? u->peer.tries - d->used : 0;
         d->peer = u->peer;
     }
     u->peer.data = d;
@@ -329,6 +346,13 @@ static ngx_int_t ngx_http_upstream_queue_peer_init_upstream(ngx_conf_t *cf, ngx_
     qscf->peer.init = uscf->peer.init;
     uscf->peer.init = ngx_http_upstream_queue_peer_init;
     ngx_queue_init(&qscf->queue);
+#if (NGX_HTTP_UPSTREAM_ZONE)
+    /* same test ngx_http_upstream_init_round_robin() uses for a `resolve` server */
+    ngx_http_upstream_server_t *server = uscf->servers ? uscf->servers->elts : NULL;
+    for (ngx_uint_t i = 0; server && i < uscf->servers->nelts; i++) {
+        if (server[i].host.len) { qscf->resolve = 1; break; }
+    }
+#endif
     return NGX_OK;
 }
 
