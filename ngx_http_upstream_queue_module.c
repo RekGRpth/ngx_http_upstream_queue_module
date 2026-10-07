@@ -184,6 +184,7 @@ static void ngx_http_upstream_queue_timeout_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, e->write ? "write" : "read");
     ngx_http_request_t *r = e->data;
     if (!r->connection || r->connection->error) return;
+    ngx_log_error(NGX_LOG_ERR, e->log, 0, "upstream queue timed out");
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_finalize_request(r, u, NGX_HTTP_GATEWAY_TIME_OUT);
 }

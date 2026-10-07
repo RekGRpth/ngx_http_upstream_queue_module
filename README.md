@@ -8,7 +8,7 @@ queue
 * Default: --
 * Context: upstream
 
-If an upstream server cannot be selected immediately while processing a request, the request will be placed into the queue. The directive specifies the maximum *number* of requests that can be in the queue at the same time. If the queue is filled up, or the server to pass the request to cannot be selected within the time period specified in the timeout parameter, the 502 (Bad Gateway) error will be returned to the client.
+If an upstream server cannot be selected immediately while processing a request, the request will be placed into the queue. The directive specifies the maximum *number* of requests that can be in the queue at the same time. If the queue is filled up, the 502 (Bad Gateway) error will be returned to the client. If the server to pass the request to cannot be selected within the time period specified in the timeout parameter, the 504 (Gateway Time-out) error will be returned to the client, and an "upstream queue timed out" error is logged.
 
 The default value of the timeout parameter is 60 seconds.
 

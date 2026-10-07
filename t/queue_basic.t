@@ -40,7 +40,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(11);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(12);
 
 my $fifo_sock = $t->testdir() . '/fifo.sock';
 my $full_sock = $t->testdir() . '/full.sock';
@@ -218,6 +218,9 @@ $t->run();
 		'queue timeout: fires around the configured 1s, not immediately '
 		. 'and not stuck')
 		or diag("elapsed: $elapsed");
+	like($t->read_file('error.log'),
+		qr!\[error\].*upstream queue timed out.*"GET /timeout/Z !,
+		'queue timeout: logged at error level, unlike a full queue');
 }
 
 ###############################################################################
