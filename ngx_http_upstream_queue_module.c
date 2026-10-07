@@ -76,12 +76,13 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         ngx_connection_t *c = u->peer.connection;
         ngx_close_connection(c);
         c->shared = 0;
-        ngx_http_upstream_handler_pt read_event_handler = u->read_event_handler;
-        ngx_http_upstream_handler_pt write_event_handler = u->write_event_handler;
         qscf->reentered = 0;
+        /*
+         * Don't touch r/u after this call: if the connect fails
+         * synchronously with no tries left, it finalizes the request
+         * and may free r->pool (and u with it) before returning.
+         */
         ngx_http_upstream_connect(r, u);
-        u->read_event_handler = read_event_handler;
-        u->write_event_handler = write_event_handler;
         /*
          * ngx_http_upstream_connect() only re-enters this function
          * (caught above via draining) when the just-dequeued request's
