@@ -371,7 +371,13 @@ static ngx_int_t ngx_http_upstream_queue_peer_init_upstream(ngx_conf_t *cf, ngx_
     qscf->peer.init = uscf->peer.init;
     uscf->peer.init = ngx_http_upstream_queue_peer_init;
     ngx_queue_init(&qscf->queue);
-#if (NGX_HTTP_UPSTREAM_ZONE)
+    /*
+     * ngx_http_upstream_rr_peer_ref() came with runtime `resolve` (nginx
+     * 1.27.3, Angie), and so did ngx_http_upstream_server_t's host;
+     * freenginx and older nginx have neither, and their peer set never
+     * changes, so there is nothing to refresh there.
+     */
+#if (NGX_HTTP_UPSTREAM_ZONE && defined ngx_http_upstream_rr_peer_ref)
     /* same test ngx_http_upstream_init_round_robin() uses for a `resolve` server */
     ngx_http_upstream_server_t *server = uscf->servers ? uscf->servers->elts : NULL;
     for (ngx_uint_t i = 0; server && i < uscf->servers->nelts; i++) {
