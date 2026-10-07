@@ -191,10 +191,18 @@ static void ngx_http_upstream_queue_connect_timeout_handler(ngx_event_t *e) {
 static void ngx_http_upstream_queue_timeout_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, e->write ? "write" : "read");
     ngx_http_request_t *r = e->data;
-    if (!r->connection || r->connection->error) return;
+    ngx_connection_t *c = r->connection;
     ngx_log_error(NGX_LOG_ERR, e->log, 0, "upstream queue timed out");
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_finalize_request(r, u, NGX_HTTP_GATEWAY_TIME_OUT);
+    /*
+     * Like any event handler that drives a request: when the client is
+     * already gone (c->error - nginx keeps a cacheable request running
+     * then), finalizing only posts the termination, and it is up to us
+     * to run it. Left posted, the request would never close, never leave
+     * the queue, and later be retried half torn down.
+     */
+    ngx_http_run_posted_requests(c);
 }
 
 static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, void *data) {
