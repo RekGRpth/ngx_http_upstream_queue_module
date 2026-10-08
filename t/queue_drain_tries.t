@@ -5,11 +5,11 @@
 # ngx_http_upstream_queue_refresh_peer() re-runs the balancer's peer.init
 # on a queued request before every retry, so it starts over from a clean,
 # current state (see queue_backup.t for why).  peer.init is written for a
-# brand new
-# request: it resets u->peer.tries to the full peer count and clears the
-# rrp->tried bitmap.  Run on a request that has already failed some
-# attempts, that hands it a fresh retry budget - proxy_next_upstream_tries
-# and the attempts already spent are both forgotten.
+# brand new request: it resets u->peer.tries to the full peer count and
+# clears the rrp->tried bitmap.  Run on a request that has already failed
+# some attempts, that hands it a fresh retry budget - proxy_next_upstream_tries
+# and the attempts already spent are both forgotten - and lets it go back
+# to the very peers it failed on.
 #
 # Worse, the retry timer refreshes the head request on every tick: the
 # reset makes an already-failed peer selectable again, the probe sees it
@@ -27,12 +27,13 @@
 #   - a holder request takes A's only slot, unanswered;
 #   - request R then fails on B (attempt 1), finds A busy and queues.
 #
-# Expected: R makes exactly one more attempt (on B again after a refresh
-# clears rrp->tried, or on A if the holder lets go first) and then gets a
-# 502 - two
-# attempts in total, as proxy_next_upstream_tries says.  Counted from
-# $upstream_addr, ignoring the upstream-name entries a queued connect
-# leaves behind.
+# Expected: R makes exactly one more attempt, on A once the holder lets go
+# - not on B again - and then gets a 502: two attempts in total, as
+# proxy_next_upstream_tries says, on two different peers, as nginx itself
+# would do without a queue.  So the module keeps the retry budget across
+# refreshes, and remembers the peers the request has failed on to mark
+# them in rrp->tried again.  Counted from $upstream_addr, ignoring the
+# upstream-name entries a queued connect leaves behind.
 #
 # The retry timer's probe needs a refresh after it as well: it calls
 # peer.get(), which marks the peer it picks in the request's rrp->tried.
@@ -154,7 +155,7 @@ $t->run_daemon(\&hold_backend, $resolve_port);
 $t->waitforfile($t->testdir() . '/dns_ready')
 	or die "dns daemon did not start\n";
 
-$t->try_run('no resolve/zone support')->plan(6);
+$t->try_run('no resolve/zone support')->plan(8);
 
 ###############################################################################
 
@@ -164,6 +165,8 @@ is($status, 502, 'static upstream: queued request ends with 502')
 	or diag("X-Upstream-Addr: $addr");
 is($attempts, 2, 'static upstream: proxy_next_upstream_tries 2 respected '
 	. 'across the queue') or diag("X-Upstream-Addr: $addr");
+is(distinct_peers($addr), 2, 'static upstream: R does not retry the peer it '
+	. 'already failed on') or diag("X-Upstream-Addr: $addr");
 
 # Give the resolver time to answer before relying on example.net.
 
@@ -175,6 +178,8 @@ is($status, 502, 'resolve upstream: queued request ends with 502')
 	or diag("X-Upstream-Addr: $addr");
 is($attempts, 2, 'resolve upstream: proxy_next_upstream_tries 2 respected '
 	. 'across snapshot refreshes') or diag("X-Upstream-Addr: $addr");
+is(distinct_peers($addr), 2, 'resolve upstream: R does not retry the peer it '
+	. 'already failed on') or diag("X-Upstream-Addr: $addr");
 
 # Peer A is not listening yet: X fails on it and disables it for 1s.
 
@@ -198,6 +203,12 @@ ok($elapsed < 3, 'retry probe: served after fail_timeout, not at the '
 	. 'queue timeout') or diag("elapsed: $elapsed");
 
 ###############################################################################
+
+sub distinct_peers {
+	my ($addr) = @_;
+	my %peers = map { $_ => 1 } $addr =~ /(\d+\.\d+\.\d+\.\d+:\d+)/g;
+	return scalar keys %peers;
+}
 
 sub scenario {
 	my ($prefix) = @_;

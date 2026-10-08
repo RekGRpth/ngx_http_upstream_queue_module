@@ -24,12 +24,14 @@ typedef struct {
     ngx_peer_connection_t peer;
     ngx_queue_t queue;
     ngx_uint_t used;
+    ngx_array_t *failed;
     ngx_flag_t deadline_set;
     ngx_msec_t deadline;
 } ngx_http_upstream_queue_data_t;
 
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e);
 static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t *d);
+static void ngx_http_upstream_queue_remember_failed(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc);
 
 static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (ngx_queue_empty(&qscf->queue) || qscf->retry.timer_set) return;
@@ -158,6 +160,13 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
     ngx_http_upstream_queue_data_t *d = data;
     d->used++;
+    /*
+     * Remember the peers this request has moved on from, as
+     * ngx_http_upstream_next() does after a failure (or a 403/404 with
+     * proxy_next_upstream), so refresh_peer() can mark them as tried
+     * again - re-running peer.init forgets them.
+     */
+    if (pc->sockaddr && (state & (NGX_PEER_FAILED|NGX_PEER_NEXT))) ngx_http_upstream_queue_remember_failed(d, pc);
     d->peer.free(pc, d->peer.data, state);
     ngx_http_upstream_t *u = d->request->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
@@ -322,6 +331,61 @@ static void ngx_http_upstream_queue_peer_save_session(ngx_peer_connection_t *pc,
 }
 #endif
 
+static void ngx_http_upstream_queue_remember_failed(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
+    ngx_pool_t *pool = d->request->pool;
+    if (!d->failed && !(d->failed = ngx_array_create(pool, 2, sizeof(ngx_addr_t)))) return;
+    ngx_addr_t *failed = d->failed->elts;
+    for (ngx_uint_t i = 0; i < d->failed->nelts; i++) {
+        if (ngx_cmp_sockaddr(failed[i].sockaddr, failed[i].socklen, pc->sockaddr, pc->socklen, 1) == NGX_OK) return;
+    }
+    struct sockaddr *sockaddr;
+    if (!(sockaddr = ngx_palloc(pool, pc->socklen))) return;
+    ngx_memcpy(sockaddr, pc->sockaddr, pc->socklen);
+    ngx_addr_t *addr;
+    if (!(addr = ngx_array_push(d->failed))) return;
+    addr->sockaddr = sockaddr;
+    addr->socklen = pc->socklen;
+    ngx_str_null(&addr->name);
+}
+
+static ngx_flag_t ngx_http_upstream_queue_rr_stale(ngx_http_upstream_rr_peers_t *peers, ngx_http_upstream_rr_peer_data_t *rrp) {
+#if defined ngx_http_upstream_conf_changed
+    return ngx_http_upstream_conf_changed(peers, rrp); /* Angie */
+#elif (NGX_HTTP_UPSTREAM_ZONE && defined ngx_http_upstream_rr_peer_ref)
+    return peers->config && rrp->config != *peers->config; /* nginx 1.27.3+ */
+#else
+    return 0; /* no runtime `resolve`: the peer set never changes */
+#endif
+}
+
+static void ngx_http_upstream_queue_mark_failed(ngx_http_upstream_queue_data_t *d) {
+    /*
+     * Only called for balancers built on round-robin (see peer_get()),
+     * whose peer data starts with ngx_http_upstream_rr_peer_data_t and
+     * whose peer.get skips peers set in rrp->tried. Peers are matched by
+     * address, not index, so this holds across `resolve` updates; if
+     * the peer set changed since peer.init sized rrp->tried, leave it -
+     * peer.get won't use this stale snapshot anyway. Only the primary
+     * set is marked: round-robin clears rrp->tried itself when it moves
+     * on to the backup set, as it would without the queue.
+     */
+    ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
+    ngx_http_upstream_rr_peers_t *peers = rrp->peers;
+    ngx_addr_t *failed = d->failed->elts;
+    ngx_http_upstream_rr_peers_rlock(peers);
+    if (!ngx_http_upstream_queue_rr_stale(peers, rrp)) {
+        ngx_uint_t i = 0;
+        for (ngx_http_upstream_rr_peer_t *peer = peers->peer; peer; peer = peer->next, i++) {
+            for (ngx_uint_t j = 0; j < d->failed->nelts; j++) {
+                if (ngx_cmp_sockaddr(peer->sockaddr, peer->socklen, failed[j].sockaddr, failed[j].socklen, 1) != NGX_OK) continue;
+                rrp->tried[i / (8 * sizeof(uintptr_t))] |= (uintptr_t) 1 << (i % (8 * sizeof(uintptr_t)));
+                break;
+            }
+        }
+    }
+    ngx_http_upstream_rr_peers_unlock(peers);
+}
+
 static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t *d) {
     /*
      * A queued request only got here because its balancer's peer.get()
@@ -346,10 +410,10 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
      * removes an address. So a request that queued before such a
      * change can never succeed on its original snapshot without it.
      *
-     * The price: the request may go back to a peer it already failed
-     * on, and ip_hash, hash and random allocate new peer data from
-     * r->pool on every refresh. The retry budget is kept below, so the
-     * former is bounded by proxy_next_upstream_tries.
+     * The retry budget and, for balancers built on round-robin, the
+     * peers already failed on are carried over below. The price left:
+     * ip_hash, hash and random allocate new peer data from r->pool on
+     * every refresh.
      */
     ngx_http_request_t *r = d->request;
     ngx_http_upstream_t *u = r->upstream;
@@ -367,6 +431,7 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
         if (u->conf->next_upstream_tries && u->peer.tries > u->conf->next_upstream_tries) u->peer.tries = u->conf->next_upstream_tries;
         u->peer.tries = u->peer.tries > d->used ? u->peer.tries - d->used : 0;
         d->peer = u->peer;
+        if (d->failed && d->peer.free == ngx_http_upstream_free_round_robin_peer) ngx_http_upstream_queue_mark_failed(d);
     }
     u->peer.data = d;
     u->peer.get = ngx_http_upstream_queue_peer_get;
