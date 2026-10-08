@@ -18,6 +18,14 @@
 #   - once fail_timeout is over, B1 is free: R may not use it, Z may.
 #
 # Expected: Z gets B1 about a second in, not a 504 at the queue timeout.
+#
+# drain(), run when a connection frees a slot, used to pop the head
+# regardless, too: a head that had failed on the freed peer went back to
+# the tail, and the slot stayed unused until the next retry tick.  Second
+# upstream: the primary is held for good; the only backup B2 fails H (its
+# backend drops the first connection) and is then held by H2 for 1s; R
+# queues behind H.  When H2 is done, R must get B2 - with retry_interval=5s
+# there is no tick to fall back on.
 
 ###############################################################################
 
@@ -49,7 +57,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(2);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(4);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the servers are written with their raw numbers below.
@@ -78,6 +86,12 @@ http {
         queue 5 timeout=6s;
     }
 
+    upstream second {
+        server 127.0.0.1:8083 max_conns=1;
+        server 127.0.0.1:8084 max_conns=1 max_fails=0 backup;
+        queue 5 timeout=8s retry_interval=5s;
+    }
+
     server {
         listen       127.0.0.1:8080;
         server_name  localhost;
@@ -88,6 +102,11 @@ http {
             proxy_pass http://backend;
             proxy_read_timeout 20s;
         }
+
+        location /second/ {
+            proxy_pass http://second;
+            proxy_read_timeout 20s;
+        }
     }
 }
 
@@ -96,6 +115,11 @@ EOF
 $t->run_daemon(\&holding_backend, $primary_port);
 $t->waitforsocket('127.0.0.1:' . $primary_port)
 	or die "backend did not start\n";
+
+$t->run_daemon(\&holding_backend, port(8083));
+$t->run_daemon(\&drop_hold_backend, port(8084));
+$t->waitforsocket('127.0.0.1:' . port(8083)) or die "backend did not start\n";
+$t->waitforsocket('127.0.0.1:' . port(8084)) or die "backend did not start\n";
 
 $t->run();
 
@@ -119,6 +143,30 @@ like($resp, qr!^HTTP/1\.[01] 200 .*^X-Upstream-Addr: backend, 127\.0\.0\.1:$b1_p
 	or diag($resp =~ /^([^\r\n]*)/ ? $1 : '(no response)');
 ok($elapsed < 3, 'once fail_timeout was over, not at the queue timeout')
 	or diag("elapsed: $elapsed");
+
+# Second upstream: H fails on B2 and queues, H2 holds B2 for 1s, R queues
+# behind H.
+
+{
+	my $h1 = send_request('/second/H1');
+	select(undef, undef, undef, 0.2);
+	my $h = send_request('/second/H');
+	select(undef, undef, undef, 0.2);
+	my $h2 = send_request('/second/H2');
+	select(undef, undef, undef, 0.2);
+
+	my $start = time();
+	my $resp = read_response(send_request('/second/R'), 8);
+	my $elapsed = time() - $start;
+
+	my $b2 = port(8084);
+
+	like($resp, qr!^HTTP/1\.[01] 200 .*^X-Upstream-Addr: second, 127\.0\.0\.1:$b2\r$!ms,
+		'second: R queued behind H, then got B2')
+		or diag($resp =~ /^([^\r\n]*)/ ? $1 : '(no response)');
+	ok($elapsed < 3, 'second: as soon as B2 was freed, not at a retry tick')
+		or diag("elapsed: $elapsed");
+}
 
 ###############################################################################
 
@@ -170,6 +218,44 @@ sub holding_backend {
 
 	while (my $client = $server->accept()) {
 		push @held, $client;
+	}
+}
+
+# Drops the first request, holds the second for 1s, answers the rest.
+
+sub drop_hold_backend {
+	my ($port) = @_;
+
+	my $server = IO::Socket::INET->new(
+		Proto => 'tcp',
+		LocalAddr => "127.0.0.1:$port",
+		Listen => 5,
+		Reuse => 1,
+	) or die "Can't create backend listening socket: $!\n";
+
+	local $SIG{CHLD} = 'IGNORE';
+	my $n = 0;
+
+	while (my $client = $server->accept()) {
+
+		# waitforsocket()'s probe sends nothing and just closes.
+
+		next unless $client->sysread(my $buf, 65536);
+
+		$n++;
+
+		if ($n == 1) {
+			$client->close();
+			next;
+		}
+
+		my $delay = $n == 2 ? 1 : 0;
+
+		next if fork();
+
+		select(undef, undef, undef, $delay);
+		$client->syswrite("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+		exit 0;
 	}
 }
 

@@ -223,23 +223,72 @@ static void ngx_http_upstream_queue_post(ngx_http_upstream_queue_data_t *d) {
     if (!d->posted.posted) { ngx_post_event(&d->posted, &ngx_posted_events); }
 }
 
-static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
+static ngx_flag_t ngx_http_upstream_queue_probe(ngx_http_upstream_queue_data_t *d, ngx_log_t *log) {
+    /*
+     * Ask the balancer, with a clean rollback, whether this request would
+     * get a peer right now. The request's own peer connection, so the
+     * balancer sees what it would on a real connect - Angie's ip_hash,
+     * hash and least_time take the request from pc->ctx, and its
+     * round-robin does on free - minus anything of an earlier attempt.
+     *
+     * The probe's peer.get() marks the peer it picked in the request's
+     * rrp->tried, and peer.free() doesn't clear it; left alone, that would
+     * keep this very request off the peer the probe just found free. The
+     * refresh drain() does before connecting takes care of it.
+     */
+    ngx_peer_connection_t probe = d->upstream->peer;
+    probe.connection = NULL;
+    probe.sockaddr = NULL;
+    probe.socklen = 0;
+    probe.name = NULL;
+    probe.cached = 0;
+    probe.log = log;
+    if (ngx_http_upstream_queue_get(d, &probe) != NGX_OK) return 0;
+    d->peer.free(&probe, d->peer.data, 0);
+    return 1;
+}
+
+static ngx_http_upstream_queue_data_t *ngx_http_upstream_queue_pick(ngx_http_upstream_queue_srv_conf_t *qscf, ngx_flag_t probe, ngx_log_t *log) {
+    /*
+     * The queued request to try next, or NULL. Finalized ones are dropped
+     * on the way. A request may not use peers it already failed on, so
+     * the head can be unable to use the very peer that is free while one
+     * behind it could: a request with peers of its own to avoid is probed
+     * and passed over when nothing is left for it. One without is what
+     * everyone behind it would see. When a slot was really freed (drain()
+     * from peer_free()), it is taken as is; on the retry timer, where
+     * nothing guarantees a free slot, it is probed too, and the search
+     * ends with it either way.
+     */
+    ngx_uint_t n = qscf->size;
+    ngx_queue_t *q = ngx_queue_head(&qscf->queue);
+    while (q != ngx_queue_sentinel(&qscf->queue) && n--) {
+        ngx_http_upstream_queue_data_t *d = ngx_queue_data(q, ngx_http_upstream_queue_data_t, queue);
+        q = ngx_queue_next(q);
+        if (ngx_http_upstream_queue_finalized(d)) {
+            ngx_http_upstream_queue_unlink(d);
+            continue;
+        }
+        ngx_flag_t avoid = d->failed && d->failed->nelts;
+        if (!probe && !avoid) return d;
+        ngx_http_upstream_queue_refresh_peer(d);
+        if (ngx_http_upstream_queue_probe(d, log)) return d;
+        if (!avoid) return NULL;
+    }
+    return NULL;
+}
+
+static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf, ngx_http_upstream_queue_data_t *first) {
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
-    while (!ngx_queue_empty(&qscf->queue)) {
-        ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
+    for (ngx_http_upstream_queue_data_t *d = first; d || (d = ngx_http_upstream_queue_pick(qscf, 0, ngx_cycle->log)); d = NULL) {
         ngx_http_upstream_queue_unlink(d);
-        /* already finalized while queued: nothing to connect, slot still free */
-        if (ngx_http_upstream_queue_finalized(d)) continue;
         /*
-         * Refresh this request's balancer data before retrying it, not
-         * just when the retry timer's own probe does it: this drain loop
-         * also runs directly from peer_free() whenever some other
-         * connection on the upstream genuinely frees a slot, and without
-         * refreshing here, the request would still be looking at the
-         * state its last NGX_BUSY left behind (see refresh_peer()) and
-         * just get silently re-queued, waiting for the next timer tick
-         * to fix what a real free-event should have fixed immediately.
+         * Refresh this request's balancer data before retrying it: the
+         * request would still be looking at the state its last NGX_BUSY
+         * left behind (see refresh_peer()), or a probe's mark, and just get
+         * silently re-queued, waiting for the next timer tick to fix what a
+         * real free-event should have fixed immediately.
          */
         ngx_http_upstream_queue_refresh_peer(d);
         ngx_http_request_t *r = d->request;
@@ -288,62 +337,13 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
     ngx_http_upstream_queue_srv_conf_t *qscf = e->data;
     /*
      * Unlike peer_free()'s drain, nothing here guarantees a slot actually
-     * freed up - this fires on a plain timer. Popping the head and
-     * reconnecting unconditionally (as peer_free() safely does, because
-     * it is only called right after a slot really did free up) would, on
-     * every tick where nothing changed, requeue the head request at the
-     * tail - breaking FIFO order for no reason. So probe the underlying
-     * peer first, with a clean rollback, and only actually touch the
-     * queue when it would truly succeed.
-     *
-     * The head may be unable to use the very peer that is free, because
-     * it already failed on it, while a request behind it could. So as
-     * long as the request probed has peers of its own to avoid, go on to
-     * the next one, and move the first that can connect to the head. A
-     * request with none sees what everyone behind it would: stop there.
+     * freed up - this fires on a plain timer. Popping a request and
+     * reconnecting unconditionally would, on every tick where nothing
+     * changed, requeue it at the tail - breaking FIFO order for no reason.
+     * So only drain a request a probe found a peer for.
      */
-    ngx_uint_t n = qscf->size;
-    ngx_queue_t *q = ngx_queue_head(&qscf->queue);
-    while (q != ngx_queue_sentinel(&qscf->queue) && n--) {
-        ngx_http_upstream_queue_data_t *d = ngx_queue_data(q, ngx_http_upstream_queue_data_t, queue);
-        q = ngx_queue_next(q);
-        if (ngx_http_upstream_queue_finalized(d)) {
-            ngx_http_upstream_queue_unlink(d);
-            continue;
-        }
-        ngx_http_upstream_queue_refresh_peer(d);
-        /*
-         * The request's own peer connection, so the balancer sees what it
-         * would on a real connect - Angie's ip_hash, hash and least_time
-         * take the request from pc->ctx, and its round-robin does on free
-         * - minus anything of an earlier attempt.
-         */
-        ngx_peer_connection_t probe = d->upstream->peer;
-        probe.connection = NULL;
-        probe.sockaddr = NULL;
-        probe.socklen = 0;
-        probe.name = NULL;
-        probe.cached = 0;
-        probe.log = e->log;
-        if (ngx_http_upstream_queue_get(d, &probe) == NGX_OK) {
-            d->peer.free(&probe, d->peer.data, 0);
-            /*
-             * The probe's peer.get() marked the peer it picked in this
-             * request's rrp->tried, and peer.free() doesn't clear it - left
-             * alone, it would keep this very request off the peer the probe
-             * just found free. drain() pops this request first and starts
-             * its balancer data over before connecting, which takes care of
-             * that.
-             */
-            if (&d->queue != ngx_queue_head(&qscf->queue)) {
-                ngx_queue_remove(&d->queue);
-                ngx_queue_insert_head(&qscf->queue, &d->queue);
-            }
-            ngx_http_upstream_queue_drain(qscf);
-            break;
-        }
-        if (!d->failed || !d->failed->nelts) break;
-    }
+    ngx_http_upstream_queue_data_t *d = ngx_http_upstream_queue_pick(qscf, 1, e->log);
+    if (d) ngx_http_upstream_queue_drain(qscf, d);
     ngx_http_upstream_queue_retry_schedule(qscf);
 }
 
@@ -362,7 +362,7 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
     ngx_http_upstream_t *u = d->request->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    ngx_http_upstream_queue_drain(qscf);
+    ngx_http_upstream_queue_drain(qscf, NULL);
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
