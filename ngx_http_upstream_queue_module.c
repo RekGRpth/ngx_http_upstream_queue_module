@@ -584,8 +584,8 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
      *
      * The retry budget and, for balancers built on round-robin, the
      * peers already failed on are carried over below. The price left:
-     * ip_hash, hash and random allocate new peer data from r->pool on
-     * every refresh.
+     * ip_hash, hash, random and least_time allocate new peer data from
+     * r->pool on every refresh.
      */
     ngx_http_request_t *r = d->request;
     ngx_http_upstream_t *u = r->upstream;
@@ -600,13 +600,15 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
     ngx_peer_connection_t outer = u->peer;
     /*
      * Hand peer.init the same u->peer a brand new request has: no hooks,
-     * and no data - except plain round-robin's own, which its peer.init
-     * reuses in place instead of allocating anew. Anything else would
-     * be misread: a wrapper such as sticky passes u->peer.data straight
-     * to round-robin, and records the hooks it finds as the "original"
-     * ones - ours from the last round, looping notify back into itself.
+     * and no data - except round-robin's own (see is_rr()), which
+     * round-robin and least_conn reuse in place instead of allocating
+     * anew, and ip_hash, hash, random and least_time ignore. Anything
+     * else would be misread: a wrapper such as sticky passes u->peer.data
+     * straight to round-robin, and records the hooks it finds as the
+     * "original" ones - ours from the last round, looping notify back
+     * into itself.
      */
-    u->peer.data = d->peer.get == ngx_http_upstream_get_round_robin_peer ? d->peer.data : NULL;
+    u->peer.data = d->rr ? d->peer.data : NULL;
     u->peer.get = NULL;
     u->peer.free = NULL;
     u->peer.notify = NULL;

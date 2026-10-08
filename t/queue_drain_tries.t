@@ -103,6 +103,13 @@ http {
     resolver 127.0.0.1:$dns_port valid=1h;
     resolver_timeout 1s;
 
+    upstream lc_backend {
+        least_conn;
+        server 127.0.0.1:8086 max_conns=1 max_fails=0;
+        server 127.0.0.1:8082 max_fails=0;
+        queue 5 timeout=5s;
+    }
+
     upstream static_backend {
         server 127.0.0.1:8081 max_conns=1 max_fails=0;
         server 127.0.0.1:8082 max_fails=0;
@@ -133,6 +140,10 @@ http {
         proxy_connect_timeout 5s;
         proxy_read_timeout 10s;
 
+        location /lc/ {
+            proxy_pass http://lc_backend;
+        }
+
         location /static/ {
             proxy_pass http://static_backend;
         }
@@ -151,11 +162,12 @@ EOF
 
 $t->run_daemon(\&dns_daemon, $t, $dns_port);
 $t->run_daemon(\&hold_backend, $static_port);
+$t->run_daemon(\&hold_backend, port(8086));
 $t->run_daemon(\&hold_backend, $resolve_port);
 $t->waitforfile($t->testdir() . '/dns_ready')
 	or die "dns daemon did not start\n";
 
-$t->try_run('no resolve/zone support')->plan(8);
+$t->try_run('no resolve/zone support')->plan(11);
 
 ###############################################################################
 
@@ -167,6 +179,18 @@ is($attempts, 2, 'static upstream: proxy_next_upstream_tries 2 respected '
 	. 'across the queue') or diag("X-Upstream-Addr: $addr");
 is(distinct_peers($addr), 2, 'static upstream: R does not retry the peer it '
 	. 'already failed on') or diag("X-Upstream-Addr: $addr");
+
+# The same with least_conn, whose balancer data refresh_peer() reuses in
+# place, as for plain round-robin.
+
+($status, $attempts, $addr) = scenario('/lc/');
+
+is($status, 502, 'least_conn upstream: queued request ends with 502')
+	or diag("X-Upstream-Addr: $addr");
+is($attempts, 2, 'least_conn upstream: proxy_next_upstream_tries 2 '
+	. 'respected across the queue') or diag("X-Upstream-Addr: $addr");
+is(distinct_peers($addr), 2, 'least_conn upstream: R does not retry the '
+	. 'peer it already failed on') or diag("X-Upstream-Addr: $addr");
 
 # Give the resolver time to answer before relying on example.net.
 
