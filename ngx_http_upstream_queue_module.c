@@ -138,6 +138,45 @@ static void ngx_http_upstream_queue_posted_handler(ngx_event_t *e) {
     ngx_http_run_posted_requests(e->data);
 }
 
+static void ngx_http_upstream_queue_post(ngx_http_upstream_queue_data_t *d) {
+    /*
+     * Have this request's posted requests run at the end of this event
+     * loop pass: finalizing it can post its termination (when its client
+     * is already gone, c->error), and whatever event got us here belongs
+     * to some other request, which runs posted requests only for its own
+     * connection once it is done. Not right away: drain() may be inside
+     * another request's peer.free(), halfway through finalizing that one,
+     * and nginx never runs posted requests at such a point. The pool
+     * cleanup withdraws the event should the request be freed first.
+     */
+    d->posted.handler = ngx_http_upstream_queue_posted_handler;
+    d->posted.data = d->request->connection;
+    d->posted.log = d->request->connection->log;
+    if (!d->posted.posted) { ngx_post_event(&d->posted, &ngx_posted_events); }
+}
+
+static ngx_flag_t ngx_http_upstream_queue_spent(ngx_http_upstream_queue_data_t *d) {
+    /*
+     * The retry budget refresh_peer() just recomputed is gone although the
+     * request has made attempts: its peer set shrank under `resolve`
+     * while it waited. A request with no attempts yet is never spent - it
+     * may just be waiting for a name to resolve at all.
+     */
+    return d->used && d->request->upstream->peer.tries == 0;
+}
+
+static void ngx_http_upstream_queue_give_up(ngx_http_upstream_queue_data_t *d) {
+    /*
+     * Fail it as ngx_http_upstream_next() would once out of tries, rather
+     * than connect once more than proxy_next_upstream_tries allows - to
+     * the one peer left, which round-robin hands out tried or not.
+     */
+    ngx_http_request_t *r = d->request;
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "upstream queue: no tries left after the peer set changed");
+    ngx_http_upstream_queue_post(d);
+    ngx_http_upstream_finalize_request(r, r->upstream, NGX_HTTP_BAD_GATEWAY);
+}
+
 static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
@@ -157,6 +196,10 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
          * to fix what a real free-event should have fixed immediately.
          */
         ngx_http_upstream_queue_refresh_peer(d);
+        if (ngx_http_upstream_queue_spent(d)) {
+            ngx_http_upstream_queue_give_up(d);
+            continue;
+        }
         ngx_http_request_t *r = d->request;
         ngx_http_upstream_t *u = r->upstream;
         ngx_connection_t *c = u->peer.connection;
@@ -170,21 +213,8 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         ngx_close_connection(c);
         c->shared = 0;
         qscf->reentered = 0;
-        /*
-         * The connect below can finalize this request, and when its client
-         * is already gone (c->error) that only posts the termination.
-         * Whatever event got us here belongs to some other request, which
-         * runs posted requests only for its own connection once it is
-         * done - so have them run for this one's too, at the end of this
-         * event loop pass. Not right here: drain() may be inside another
-         * request's peer.free(), halfway through finalizing it, and nginx
-         * never runs posted requests at such a point. The pool cleanup
-         * withdraws the event should the request be freed first.
-         */
-        d->posted.handler = ngx_http_upstream_queue_posted_handler;
-        d->posted.data = r->connection;
-        d->posted.log = r->connection->log;
-        if (!d->posted.posted) { ngx_post_event(&d->posted, &ngx_posted_events); }
+        /* the connect below can finalize this request */
+        ngx_http_upstream_queue_post(d);
         /*
          * Don't touch r/u after this call: if the connect fails
          * synchronously with no tries left, it finalizes the request
@@ -210,8 +240,14 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
     ngx_http_upstream_queue_srv_conf_t *qscf = e->data;
     while (!ngx_queue_empty(&qscf->queue)) {
         ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
-        if (!ngx_http_upstream_queue_finalized(d)) break;
+        if (ngx_http_upstream_queue_finalized(d)) {
+            ngx_http_upstream_queue_unlink(d);
+            continue;
+        }
+        ngx_http_upstream_queue_refresh_peer(d);
+        if (!ngx_http_upstream_queue_spent(d)) break;
         ngx_http_upstream_queue_unlink(d);
+        ngx_http_upstream_queue_give_up(d);
     }
     if (!ngx_queue_empty(&qscf->queue)) {
         /*
@@ -227,7 +263,6 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
          * succeed.
          */
         ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
-        ngx_http_upstream_queue_refresh_peer(d);
         ngx_peer_connection_t probe;
         ngx_memzero(&probe, sizeof(ngx_peer_connection_t));
         probe.log = e->log;
