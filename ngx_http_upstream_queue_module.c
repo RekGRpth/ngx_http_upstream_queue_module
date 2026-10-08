@@ -5,6 +5,7 @@ ngx_module_t ngx_http_upstream_queue_module;
 
 typedef struct {
     ngx_flag_t detect;
+    ngx_flag_t detect_warned;
     ngx_flag_t draining;
     ngx_flag_t reentered;
     ngx_http_upstream_peer_t peer;
@@ -225,7 +226,19 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    if (qscf->detect) {
+    /*
+     * Detection scans the peer data as round-robin's, which only holds
+     * for balancers built on it - round-robin itself, least_conn,
+     * ip_hash, hash and random, all of which keep its peer.free. With
+     * any other (e.g. the third-party fair), the scan would read some
+     * other structure: skip it there, as if detection were off.
+     */
+    if (qscf->detect && d->peer.free != ngx_http_upstream_free_round_robin_peer) {
+        if (!qscf->detect_warned) {
+            ngx_log_error(NGX_LOG_WARN, pc->log, 0, "queue_detect_all_peer_down is ignored: the load balancing method is not based on round-robin");
+            qscf->detect_warned = 1;
+        }
+    } else if (qscf->detect) {
         ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
         time_t now = ngx_time();
         ngx_flag_t all_peers_down = 1;
