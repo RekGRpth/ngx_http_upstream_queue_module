@@ -19,6 +19,15 @@
 # Expected: R times out after 1s like any queued request ("upstream queue
 # timed out" in error.log), so Q finds the queue empty, queues, and gets
 # its own 504 after 1s - not an immediate 502 for a full queue.
+#
+# Finalizing such a request only posts its termination, and whoever drives
+# it has to run posted requests afterwards - the timeout handler, and also
+# ngx_http_upstream_queue_drain(), whose connect can finalize the request
+# it pops.  The second scenario covers drain(): a cacheable request R2
+# whose client went away waits for the only peer, a unix socket; when
+# the holder lets go, that socket is gone, so R2's connect fails
+# synchronously with no tries left.  R2 must then be closed for good
+# (logged in access.log), not left hanging with its client connection.
 
 ###############################################################################
 
@@ -28,6 +37,8 @@ use strict;
 use Test::More;
 use IO::Select;
 use IO::Socket::INET;
+use IO::Socket::UNIX;
+use Socket qw/ SOCK_STREAM /;
 use Time::HiRes qw/ time /;
 
 BEGIN {
@@ -50,7 +61,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy cache/)->plan(3);
+my $t = Test::Nginx->new()->has(qw/http proxy cache/)->plan(4);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the server is written with its raw number below.
@@ -73,10 +84,16 @@ http {
     %%TEST_GLOBALS_HTTP%%
 
     proxy_cache_path %%TESTDIR%%/cache keys_zone=cache:1m;
+    access_log %%TESTDIR%%/access.log;
 
     upstream backend {
         server 127.0.0.1:8081 max_conns=1;
         queue 1 timeout=1s;
+    }
+
+    upstream drain_backend {
+        server unix:%%TESTDIR%%/drain.sock max_conns=1 max_fails=0;
+        queue 1 timeout=10s;
     }
 
     server {
@@ -89,6 +106,13 @@ http {
             proxy_cache_valid 200 1m;
             proxy_read_timeout 5s;
         }
+
+        location /drain/ {
+            proxy_pass http://drain_backend;
+            proxy_cache cache;
+            proxy_cache_valid 200 1m;
+            proxy_read_timeout 5s;
+        }
     }
 }
 
@@ -97,6 +121,10 @@ EOF
 $t->run_daemon(\&holding_backend, $port);
 $t->waitforsocket('127.0.0.1:' . $port)
 	or die "backend did not start\n";
+
+my $drain_sock = $t->testdir() . '/drain.sock';
+$t->run_daemon(\&vanishing_backend, $drain_sock);
+$t->waitforfile($drain_sock) or die "unix backend did not start\n";
 
 $t->run();
 
@@ -127,6 +155,23 @@ ok($elapsed > 0.7, 'it waits out its own timeout, rather than being '
 	. 'turned away as if the queue were full') or diag("elapsed: $elapsed");
 
 read_response($holder, 6);
+
+# R2 queues behind holder2, then its client goes away; when holder2 is
+# let go, drain() pops R2 into a connect that fails synchronously.
+
+my $holder2 = send_request('/drain/holder');
+select(undef, undef, undef, 0.2);
+
+my $r2 = send_request('/drain/R2');
+select(undef, undef, undef, 0.3);
+$r2->close();
+
+read_response($holder2, 5);
+select(undef, undef, undef, 0.5);
+
+like($t->read_file('access.log'), qr!"GET /drain/R2 !,
+	'drained request whose client went away is closed when its connect '
+	. 'fails');
 
 ###############################################################################
 
@@ -162,6 +207,32 @@ sub read_response {
 	}
 
 	return $resp;
+}
+
+sub vanishing_backend {
+	my ($path) = @_;
+
+	unlink $path;
+
+	my $server = IO::Socket::UNIX->new(
+		Type => SOCK_STREAM,
+		Local => $path,
+		Listen => 5,
+	) or die "Can't create unix listening socket: $!\n";
+
+	my $client = $server->accept()
+		or die "Can't accept unix connection: $!\n";
+
+	# From here on, connect() to $path fails synchronously with ENOENT.
+
+	$server->close();
+	unlink $path;
+
+	select(undef, undef, undef, 1);
+
+	$client->close();
+
+	exit 0;
 }
 
 sub holding_backend {
