@@ -22,6 +22,7 @@ typedef struct {
     ngx_event_t timeout;
     ngx_event_t posted;
     ngx_http_request_t *request;
+    ngx_http_upstream_t *upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf;
     ngx_peer_connection_t peer;
     ngx_queue_t queue;
@@ -45,8 +46,12 @@ static ngx_flag_t ngx_http_upstream_queue_finalized(ngx_http_upstream_queue_data
      * so the pool cleanup that takes d out of the queue only runs once
      * the main request is done. Such a d must just be dropped from the
      * queue - its upstream, placeholder connection included, is gone.
+     * And r->upstream may not be its upstream any more: a finalized
+     * request can start over with another one - post_action, which runs
+     * when the client goes away, or error_page into another proxy_pass -
+     * and that one, not finalized, would make the d look live.
      */
-    return d->request->upstream->cleanup == NULL;
+    return d->request->upstream != d->upstream || d->upstream->cleanup == NULL;
 }
 
 static ngx_flag_t ngx_http_upstream_queue_is_rr(void *data, ngx_http_upstream_srv_conf_t *uscf) {
@@ -654,6 +659,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     d->rr = ngx_http_upstream_queue_is_rr(d->peer.data, uscf);
     d->budget = ngx_http_upstream_queue_budget(u);
     d->request = r;
+    d->upstream = u;
     d->qscf = qscf;
     ngx_http_upstream_queue_set_hooks(u, d);
     return NGX_OK;
