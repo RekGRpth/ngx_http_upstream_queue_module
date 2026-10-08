@@ -203,12 +203,12 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
             d->peer.free(&probe, d->peer.data, 0);
             /*
              * The probe's peer.get() marked the peer it picked in this
-             * request's rrp->tried, and peer.free() doesn't clear it -
-             * left alone, the drain below could not pick the very peer
-             * the probe just found free. Start the request's balancer
-             * data over.
+             * request's rrp->tried, and peer.free() doesn't clear it - left
+             * alone, it would keep this very request off the peer the probe
+             * just found free. drain() pops this same request first and
+             * starts its balancer data over before connecting, which takes
+             * care of that.
              */
-            ngx_http_upstream_queue_refresh_peer(d);
             ngx_http_upstream_queue_drain(qscf);
         }
     }
