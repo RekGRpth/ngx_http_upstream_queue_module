@@ -18,6 +18,16 @@ typedef struct {
 } ngx_http_upstream_queue_srv_conf_t;
 
 typedef struct {
+#if defined ngx_http_upstream_conf_changed
+    /*
+     * Angie, told apart by ngx_http_upstream_conf_changed(), takes
+     * u->peer.data for round-robin's peer data in an upstream with a zone
+     * (ngx_http_upstream_need_connection_drop() follows rrp->current on
+     * every request) - and u->peer.data is ours. So lead with one, its
+     * current set after every peer.get to the wrapped balancer's.
+     */
+    ngx_http_upstream_rr_peer_data_t rrp;
+#endif
     ngx_event_t connect_timeout;
     ngx_event_t timeout;
     ngx_event_t posted;
@@ -401,6 +411,9 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
     ngx_http_upstream_queue_data_t *d = data;
     ngx_int_t rc = ngx_http_upstream_queue_get(d, pc);
+#if defined ngx_http_upstream_conf_changed
+    if (rc == NGX_OK) d->rrp.current = d->rr ? ((ngx_http_upstream_rr_peer_data_t *) d->peer.data)->current : NULL;
+#endif
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
     if (rc != NGX_BUSY) { d->deadline_set = 0; return rc; }
     ngx_http_request_t *r = d->request;
