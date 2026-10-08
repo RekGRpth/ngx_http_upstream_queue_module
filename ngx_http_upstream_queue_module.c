@@ -244,6 +244,12 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         if (c->pool) ngx_destroy_pool(c->pool);
         ngx_close_connection(c);
         c->shared = 0;
+        /*
+         * Not left pointing at the closed placeholder for the balancer's
+         * peer.get to see: Angie's round-robin, for one, counts a free with
+         * a connection as a check that passed.
+         */
+        u->peer.connection = NULL;
         qscf->reentered = 0;
         /* the connect below can finalize this request */
         ngx_http_upstream_queue_post(d);
@@ -296,8 +302,18 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
             continue;
         }
         ngx_http_upstream_queue_refresh_peer(d);
-        ngx_peer_connection_t probe;
-        ngx_memzero(&probe, sizeof(ngx_peer_connection_t));
+        /*
+         * The request's own peer connection, so the balancer sees what it
+         * would on a real connect - Angie's ip_hash, hash and least_time
+         * take the request from pc->ctx, and its round-robin does on free
+         * - minus anything of an earlier attempt.
+         */
+        ngx_peer_connection_t probe = d->upstream->peer;
+        probe.connection = NULL;
+        probe.sockaddr = NULL;
+        probe.socklen = 0;
+        probe.name = NULL;
+        probe.cached = 0;
         probe.log = e->log;
         if (ngx_http_upstream_queue_get(d, &probe) == NGX_OK) {
             d->peer.free(&probe, d->peer.data, 0);
