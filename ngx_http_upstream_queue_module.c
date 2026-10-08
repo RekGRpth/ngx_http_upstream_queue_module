@@ -20,6 +20,7 @@ typedef struct {
 typedef struct {
     ngx_event_t connect_timeout;
     ngx_event_t timeout;
+    ngx_event_t posted;
     ngx_http_request_t *request;
     ngx_http_upstream_queue_srv_conf_t *qscf;
     ngx_peer_connection_t peer;
@@ -101,6 +102,10 @@ static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_c
     ngx_add_timer(&qscf->retry, qscf->retry_interval);
 }
 
+static void ngx_http_upstream_queue_posted_handler(ngx_event_t *e) {
+    ngx_http_run_posted_requests(e->data);
+}
+
 static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
@@ -133,22 +138,27 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         ngx_close_connection(c);
         c->shared = 0;
         qscf->reentered = 0;
-        ngx_connection_t *client = r->connection;
+        /*
+         * The connect below can finalize this request, and when its client
+         * is already gone (c->error) that only posts the termination.
+         * Whatever event got us here belongs to some other request, which
+         * runs posted requests only for its own connection once it is
+         * done - so have them run for this one's too, at the end of this
+         * event loop pass. Not right here: drain() may be inside another
+         * request's peer.free(), halfway through finalizing it, and nginx
+         * never runs posted requests at such a point. The pool cleanup
+         * withdraws the event should the request be freed first.
+         */
+        d->posted.handler = ngx_http_upstream_queue_posted_handler;
+        d->posted.data = r->connection;
+        d->posted.log = r->connection->log;
+        if (!d->posted.posted) { ngx_post_event(&d->posted, &ngx_posted_events); }
         /*
          * Don't touch r/u after this call: if the connect fails
          * synchronously with no tries left, it finalizes the request
          * and may free r->pool (and u with it) before returning.
          */
         ngx_http_upstream_connect(r, u);
-        /*
-         * Whatever event got us here belongs to some other request, so
-         * run this one's posted requests ourselves, as nginx's own
-         * upstream handler would: if its client is already gone
-         * (c->error), finalizing it above only posted its termination.
-         * Safe after a free: the connection itself outlives the request
-         * and is marked destroyed once closed.
-         */
-        ngx_http_run_posted_requests(client);
         /*
          * ngx_http_upstream_connect() only re-enters this function
          * (caught above via draining) when the just-dequeued request's
@@ -233,6 +243,7 @@ static void ngx_http_upstream_queue_cleanup_handler(void *data) {
      * which unlink() is safe against.
      */
     ngx_http_upstream_queue_unlink(d);
+    if (d->posted.posted) { ngx_delete_posted_event(&d->posted); }
 }
 
 static void ngx_http_upstream_queue_connect_timeout_handler(ngx_event_t *e) {

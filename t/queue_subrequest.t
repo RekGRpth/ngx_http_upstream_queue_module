@@ -20,6 +20,13 @@
 # Expected: /q/sub times out after 1s, the holder's answer drains the
 # queue without tripping over it, and the page completes - no crash
 # ("worker process ... exited on signal 11" is an [alert]).
+#
+# A second page has both of its includes go through one queue, to a unix
+# socket that disappears after its first connection: X takes the only
+# slot, Y waits.  When X is done, its own peer.free() drains the queue
+# and Y's connect fails synchronously, finalizing Y - from inside X's
+# finalization, both subrequests of one main request.  The page must
+# still come out whole and in order: X's body, then Y's 502 page.
 
 ###############################################################################
 
@@ -29,6 +36,8 @@ use strict;
 use Test::More;
 use IO::Select;
 use IO::Socket::INET;
+use IO::Socket::UNIX;
+use Socket qw/ SOCK_STREAM /;
 
 BEGIN {
 	use FindBin;
@@ -50,7 +59,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy ssi/)->plan(3);
+my $t = Test::Nginx->new()->has(qw/http proxy ssi/)->plan(4);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the servers are written with their raw numbers below.
@@ -78,12 +87,21 @@ http {
         queue 5 timeout=1s;
     }
 
+    upstream u {
+        server unix:%%TESTDIR%%/u.sock max_conns=1 max_fails=0;
+        queue 5 timeout=5s;
+    }
+
     server {
         listen       127.0.0.1:8080;
         server_name  localhost;
 
         location /q/ {
             proxy_pass http://q;
+        }
+
+        location /u/ {
+            proxy_pass http://u;
         }
 
         location /slow {
@@ -93,6 +111,10 @@ http {
         location = /page.html {
             ssi on;
         }
+
+        location = /page2.html {
+            ssi on;
+        }
     }
 }
 
@@ -100,6 +122,8 @@ EOF
 
 $t->write_file('page.html',
 	'<!--# include virtual="/q/sub" -->|<!--# include virtual="/slow" -->');
+$t->write_file('page2.html',
+	'[<!--# include virtual="/u/x" -->|<!--# include virtual="/u/y" -->]');
 
 $t->run_daemon(\&delayed_backend, $queue_port, 2);
 $t->run_daemon(\&delayed_backend, $slow_port, 3);
@@ -107,6 +131,10 @@ $t->waitforsocket('127.0.0.1:' . $queue_port)
 	or die "queue backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . $slow_port)
 	or die "slow backend did not start\n";
+
+my $u_sock = $t->testdir() . '/u.sock';
+$t->run_daemon(\&vanishing_backend, $u_sock);
+$t->waitforfile($u_sock) or die "unix backend did not start\n";
 
 $t->run();
 
@@ -127,6 +155,10 @@ like($t->read_file('error.log'),
 	'the include itself timed out in the queue');
 like(read_response($holder, 3), qr!^HTTP/1\.[01] 200 !,
 	'holder served, draining the queue past the finalized include');
+
+like(read_response(send_request('/page2.html'), 5),
+	qr!^HTTP/1\.[01] 200 .*\[.*\bX\b.*\|.*502 Bad Gateway.*\].*\r\n0\r\n!s,
+	'include finalized from inside a sibling\'s finalization: page whole');
 
 ###############################################################################
 
@@ -166,6 +198,33 @@ sub read_response {
 
 # Answers each request with 200 after $delay seconds, one connection
 # each, so a held request doesn't block the next one.
+
+# Answers the first request after 1s, but stops listening as soon as it
+# has accepted it, so every later connect() fails synchronously.
+
+sub vanishing_backend {
+	my ($path) = @_;
+
+	unlink $path;
+
+	my $server = IO::Socket::UNIX->new(
+		Type => SOCK_STREAM,
+		Local => $path,
+		Listen => 5,
+	) or die "Can't create unix listening socket: $!\n";
+
+	my $client = $server->accept()
+		or die "Can't accept unix connection: $!\n";
+
+	$server->close();
+	unlink $path;
+
+	$client->sysread(my $buf, 65536);
+	select(undef, undef, undef, 1);
+	$client->syswrite("HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nX");
+
+	exit 0;
+}
 
 sub delayed_backend {
 	my ($port, $delay) = @_;
