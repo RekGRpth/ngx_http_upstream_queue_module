@@ -102,18 +102,17 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
          * to change or for its queue timeout, as with any busy upstream.
          */
         ngx_http_upstream_rr_peers_t *peers = ((ngx_http_upstream_rr_peer_data_t *) d->peer.data)->peers;
-        if (peers->single && (!peers->next || !peers->next->number)) {
-            ngx_http_upstream_rr_peers_rlock(peers);
-            ngx_flag_t failed = 0;
-            if (peers->peer) {
-                ngx_peer_connection_t one = { .sockaddr = peers->peer->sockaddr, .socklen = peers->peer->socklen };
-                failed = ngx_http_upstream_queue_failed_before(d, &one);
-            }
-            ngx_http_upstream_rr_peers_unlock(peers);
-            if (failed) {
-                pc->name = peers->name;
-                return NGX_BUSY;
-            }
+        ngx_http_upstream_rr_peers_rlock(peers);
+        /* single: one peer, and no backups either */
+        ngx_flag_t failed = 0;
+        if (peers->single && peers->peer) {
+            ngx_peer_connection_t one = { .sockaddr = peers->peer->sockaddr, .socklen = peers->peer->socklen };
+            failed = ngx_http_upstream_queue_failed_before(d, &one);
+        }
+        ngx_http_upstream_rr_peers_unlock(peers);
+        if (failed) {
+            pc->name = peers->name;
+            return NGX_BUSY;
         }
     }
     ngx_int_t rc = d->peer.get(pc, d->peer.data);
@@ -137,7 +136,10 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
          * NGX_PEER_FAILED then counts as a check that passed, resetting
          * its fails - although nothing was sent to it. Put checked back
          * to the time of the last failure first, as if it had not been
-         * picked, so the next request re-checks it for real. (Angie,
+         * picked, so the next request re-checks it for real. If another
+         * request is re-checking it at this very moment, its mark is lost
+         * as well, and its success then won't clear the peer's fails -
+         * there is no telling the two apart. (Angie,
          * told apart by its ngx_http_upstream_conf_changed(), only counts
          * a check as passed when there was a connection, which a peer
          * handed back here never has.)
@@ -367,10 +369,7 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
      */
     if (pc->sockaddr && (state & (NGX_PEER_FAILED|NGX_PEER_NEXT))) ngx_http_upstream_queue_remember_failed(d, pc);
     d->peer.free(pc, d->peer.data, state);
-    ngx_http_upstream_t *u = d->request->upstream;
-    ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
-    ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    ngx_http_upstream_queue_drain(qscf, NULL);
+    ngx_http_upstream_queue_drain(d->qscf, NULL);
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
@@ -425,9 +424,8 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
     if (rc != NGX_BUSY) { d->deadline_set = 0; return rc; }
     ngx_http_request_t *r = d->request;
-    ngx_http_upstream_t *u = r->upstream;
-    ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
-    ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
+    ngx_http_upstream_t *u = d->upstream;
+    ngx_http_upstream_queue_srv_conf_t *qscf = d->qscf;
     /*
      * Detection scans the peer data as round-robin's, which only holds
      * for balancers built on it (see is_rr()). With any other, the scan
@@ -633,8 +631,8 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
      *
      * The retry budget and, for balancers built on round-robin, the
      * peers already failed on are carried over below. The price left:
-     * ip_hash, hash, random and least_time allocate new peer data from
-     * r->pool on every refresh.
+     * ip_hash, hash and random (and nginx's least_time) allocate new peer
+     * data from r->pool on every refresh.
      */
     ngx_http_request_t *r = d->request;
     ngx_http_upstream_t *u = r->upstream;
@@ -650,8 +648,9 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
     /*
      * Hand peer.init the same u->peer a brand new request has: no hooks,
      * and no data - except round-robin's own (see is_rr()), which
-     * round-robin and least_conn reuse in place instead of allocating
-     * anew, and ip_hash, hash, random and least_time ignore. Anything
+     * round-robin, least_conn and Angie's least_time reuse in place
+     * instead of allocating anew, and ip_hash, hash, random and nginx's
+     * least_time ignore. Anything
      * else would be misread: a wrapper such as sticky passes u->peer.data
      * straight to round-robin, and records the hooks it finds as the
      * "original" ones - ours from the last round, looping notify back
