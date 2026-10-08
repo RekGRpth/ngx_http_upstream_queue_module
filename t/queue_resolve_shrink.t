@@ -1,25 +1,28 @@
 #!/usr/bin/perl
 
-# Regression test for ngx_http_upstream_queue_module.
+# Tests for ngx_http_upstream_queue_module: a queued request whose
+# `resolve` server's addresses change while it waits, after it already
+# failed on one of them.
 #
-# Before a queued request is retried, refresh_peer() re-runs peer.init and
-# recomputes its retry budget: the peer count (capped by
-# proxy_next_upstream_tries) minus the attempts already made.  When a
-# `resolve` server's addresses shrink while the request waits, that can
-# come out at zero - yet drain() still connected the request, one attempt
-# more than allowed, and to the one peer left, which round-robin's single
-# peer path hands out whether tried or not.
+# Before each retry, refresh_peer() re-runs peer.init and sets the
+# request's retry budget: the peer count, capped by
+# proxy_next_upstream_tries, minus the attempts already made.  The
+# budget must not shrink with the peer set - neither a set that briefly
+# resolves to nothing nor one that shrinks to peers the request never
+# tried may cost it its remaining attempts.  But neither may the request
+# go back to a peer it already failed on just because that is the only
+# one left: round-robin hands a single peer out whether tried or not.
 #
-# Layout: one `resolve` name, max_conns=1, max_fails=0.  It first resolves
-# to 127.0.0.1, where nothing listens, and 127.0.0.2, where a backend
-# holds whatever connects.
-#   - H ends up holding 127.0.0.2;
-#   - R fails on 127.0.0.1 (1 of its 2 tries), finds 127.0.0.2 busy and
-#     queues;
-#   - the name then resolves to 127.0.0.1 alone: one peer, R has no tries
-#     left.
-#
-# Expected: R gets its 502 without connecting to 127.0.0.1 again.
+# Each scenario has its own `resolve` name and port, max_conns=1 and
+# max_fails=0, first resolving to 127.0.0.1, where nothing listens, and
+# 127.0.0.2, where a backend holds the first connection (H's) for 4s and
+# answers everything with 200.  R fails on 127.0.0.1 (1 of its 2 tries),
+# finds 127.0.0.2 busy and queues.  Then the name changes:
+#   - A: to 127.0.0.1 alone - R must not try it again, and waits out
+#     the queue (504);
+#   - B: to 127.0.0.2 alone - R must get it once H is done (200);
+#   - C: to nothing for a while, then back to both - R must wait and get
+#     127.0.0.2 once H is done (200).
 
 ###############################################################################
 
@@ -56,7 +59,7 @@ IO::Socket::INET->new(LocalAddr => '127.0.0.2:0', Listen => 1)
 
 my $t = Test::Nginx->new()->has(qw/http proxy upstream_zone/);
 
-my $port = port(8081);
+my %port = (a => port(8081), b => port(8082), c => port(8083));
 my $dns_port = port(8982, udp => 1);
 
 $t->write_file_expand('nginx.conf', <<"EOF");
@@ -77,9 +80,21 @@ http {
     resolver 127.0.0.1:$dns_port valid=1s;
     resolver_timeout 1s;
 
-    upstream backend {
-        zone backend 64k;
-        server multi.example.net:$port resolve max_conns=1 max_fails=0;
+    upstream a {
+        zone a 64k;
+        server a.example.net:$port{a} resolve max_conns=1 max_fails=0;
+        queue 5 timeout=3s;
+    }
+
+    upstream b {
+        zone b 64k;
+        server b.example.net:$port{b} resolve max_conns=1 max_fails=0;
+        queue 5 timeout=6s;
+    }
+
+    upstream c {
+        zone c 64k;
+        server c.example.net:$port{c} resolve max_conns=1 max_fails=0;
         queue 5 timeout=8s;
     }
 
@@ -90,8 +105,16 @@ http {
         add_header X-Upstream-Addr \$upstream_addr always;
         proxy_read_timeout 10s;
 
-        location / {
-            proxy_pass http://backend;
+        location /a/ {
+            proxy_pass http://a;
+        }
+
+        location /b/ {
+            proxy_pass http://b;
+        }
+
+        location /c/ {
+            proxy_pass http://c;
         }
     }
 }
@@ -99,12 +122,13 @@ http {
 EOF
 
 $t->run_daemon(\&dns_daemon, $t, $dns_port);
-$t->run_daemon(\&holding_backend, '127.0.0.2', $port);
+$t->run_daemon(\&first_held_backend, '127.0.0.2', $port{$_}) for qw/ a b c /;
 $t->waitforfile($t->testdir() . '/dns_ready')
 	or die "dns daemon did not start\n";
-$t->waitforsocket("127.0.0.2:$port") or die "backend did not start\n";
+$t->waitforsocket("127.0.0.2:$port{$_}") or die "backend did not start\n"
+	for qw/ a b c /;
 
-$t->try_run('no resolve/zone support')->plan(3);
+$t->try_run('no resolve/zone support')->plan(7);
 
 # Give the resolver time to answer with both addresses.
 
@@ -112,32 +136,79 @@ select(undef, undef, undef, 1.5);
 
 ###############################################################################
 
-my $h = send_request('/H');
-select(undef, undef, undef, 0.3);
+# A: down to the peer R already failed on.
 
-my $start = time();
-my $r = send_request('/R');
-select(undef, undef, undef, 0.3);
+{
+	my ($resp, $addr, $elapsed) = scenario('a', sub {
+		$t->write_file('a_only_1', '');
+	});
 
-# Now only 127.0.0.1.
+	like($resp, qr!^HTTP/1\.[01] 504 !, 'A: R waits out the queue')
+		or diag("X-Upstream-Addr: $addr");
+	is(attempts($addr, '127.0.0.1', $port{a}), 1,
+		'A: without trying the peer it failed on again')
+		or diag("X-Upstream-Addr: $addr");
+}
 
-$t->write_file('shrunk', '');
+# B: down to the peer R never tried.
 
-my $resp = read_response($r, 10);
-my $elapsed = time() - $start;
+{
+	my ($resp, $addr, $elapsed) = scenario('b', sub {
+		$t->write_file('b_only_2', '');
+	});
 
-my ($addr) = $resp =~ /^X-Upstream-Addr: ([^\r\n]*)/mi;
-$addr //= '';
-my $tries = () = $addr =~ /127\.0\.0\.1:$port/g;
+	like($resp, qr!^HTTP/1\.[01] 200 !, 'B: R gets the peer it never tried')
+		or diag("X-Upstream-Addr: $addr");
+	ok($elapsed < 5.5, 'B: once H is done with it')
+		or diag("elapsed: $elapsed");
+}
 
-like($resp, qr!^HTTP/1\.[01] 502 !, 'R gets 502')
-	or diag("X-Upstream-Addr: $addr");
-is($tries, 1, 'without a second attempt on the peer it failed on')
-	or diag("X-Upstream-Addr: $addr");
-ok($elapsed < 6, 'once the shrink is seen, not at the queue timeout')
-	or diag("elapsed: $elapsed");
+# C: no addresses for a while, then both again.
+
+{
+	my ($resp, $addr, $elapsed) = scenario('c', sub {
+		$t->write_file('c_empty', '');
+		select(undef, undef, undef, 2);
+		unlink $t->testdir() . '/c_empty';
+	});
+
+	like($resp, qr!^HTTP/1\.[01] 200 !, 'C: R survives the empty answers')
+		or diag("X-Upstream-Addr: $addr");
+	is(attempts($addr, '127.0.0.1', $port{c}), 1,
+		'C: and gets the peer it never tried, not the one it failed on')
+		or diag("X-Upstream-Addr: $addr");
+	ok($elapsed < 7, 'C: before the queue timeout')
+		or diag("elapsed: $elapsed");
+}
 
 ###############################################################################
+
+sub scenario {
+	my ($name, $change) = @_;
+
+	my $h = send_request("/$name/H");
+	select(undef, undef, undef, 0.3);
+
+	my $start = time();
+	my $r = send_request("/$name/R");
+	select(undef, undef, undef, 0.3);
+
+	$change->();
+
+	my $resp = read_response($r, 10);
+	my $elapsed = time() - $start;
+
+	my ($addr) = $resp =~ /^X-Upstream-Addr: ([^\r\n]*)/mi;
+
+	read_response($h, 6);
+
+	return ($resp, $addr // '', $elapsed);
+}
+
+sub attempts {
+	my ($addr, $ip, $port) = @_;
+	return scalar(() = $addr =~ /\Q$ip\E:$port\b/g);
+}
 
 sub send_request {
 	my ($uri) = @_;
@@ -173,7 +244,9 @@ sub read_response {
 	return $resp;
 }
 
-sub holding_backend {
+# Holds the first connection for 4s, then answers every request with 200.
+
+sub first_held_backend {
 	my ($host, $port) = @_;
 
 	my $server = IO::Socket::INET->new(
@@ -183,15 +256,31 @@ sub holding_backend {
 		Reuse => 1,
 	) or die "Can't create backend listening socket: $!\n";
 
-	my @held;
+	local $SIG{CHLD} = 'IGNORE';
+	my $first = 1;
 
 	while (my $client = $server->accept()) {
-		push @held, $client;
+		my $delay = 0;
+
+		# waitforsocket()'s probe sends nothing and just closes.
+
+		next unless $client->sysread(my $buf, 65536);
+
+		if ($first) {
+			$first = 0;
+			$delay = 4;
+		}
+
+		next if fork();
+
+		select(undef, undef, undef, $delay);
+		$client->syswrite("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+		exit 0;
 	}
 }
 
-# Minimal mock DNS server: multi.example.net resolves to 127.0.0.1 and
-# 127.0.0.2, or to 127.0.0.1 alone once the test creates "shrunk" - see
+# Minimal mock DNS server: [abc].example.net resolve to 127.0.0.1 and
+# 127.0.0.2, changed by files the test creates - see
 # t/queue_resolve_gap.t for the fuller, commented version.
 
 sub dns_daemon {
@@ -235,11 +324,21 @@ sub dns_reply {
 	$offset -= 1;
 	my ($id, $type, $class) = unpack("n x$offset n2", $recv_data);
 	my $name = join('.', @name);
+	my $d = $t->testdir();
 
-	if ($name eq 'multi.example.net' && $type == A) {
-		push @rdata, pack('n3N nC4', 0xc00c, A, IN, $ttl, 4, 127, 0, 0, 1);
-		push @rdata, pack('n3N nC4', 0xc00c, A, IN, $ttl, 4, 127, 0, 0, 2)
-			unless -e $t->testdir() . '/shrunk';
+	my @addrs;
+
+	if ($name eq 'a.example.net') {
+		@addrs = -e "$d/a_only_1" ? (1) : (1, 2);
+	} elsif ($name eq 'b.example.net') {
+		@addrs = -e "$d/b_only_2" ? (2) : (1, 2);
+	} elsif ($name eq 'c.example.net') {
+		@addrs = -e "$d/c_empty" ? () : (1, 2);
+	}
+
+	if ($type == A) {
+		push @rdata, pack('n3N nC4', 0xc00c, A, IN, $ttl, 4, 127, 0, 0, $_)
+			for @addrs;
 	}
 
 	$len = @name;

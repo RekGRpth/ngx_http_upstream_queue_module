@@ -26,6 +26,7 @@ typedef struct {
     ngx_peer_connection_t peer;
     ngx_queue_t queue;
     ngx_uint_t used;
+    ngx_uint_t budget;
     ngx_array_t *failed;
     ngx_flag_t rr;
     ngx_flag_t deadline_set;
@@ -74,6 +75,29 @@ static ngx_flag_t ngx_http_upstream_queue_failed_before(ngx_http_upstream_queue_
 }
 
 static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
+    if (d->rr && d->failed) {
+        /*
+         * One peer and no backups: round-robin hands it out whether this
+         * request already failed on it or not. If it did - e.g. a `resolve`
+         * name shrank to just that peer while the request waited - there
+         * is nothing it may use: stay busy, so it waits for the peer set
+         * to change or for its queue timeout, as with any busy upstream.
+         */
+        ngx_http_upstream_rr_peers_t *peers = ((ngx_http_upstream_rr_peer_data_t *) d->peer.data)->peers;
+        if (peers->single && (!peers->next || !peers->next->number)) {
+            ngx_http_upstream_rr_peers_rlock(peers);
+            ngx_flag_t failed = 0;
+            if (peers->peer) {
+                ngx_peer_connection_t one = { .sockaddr = peers->peer->sockaddr, .socklen = peers->peer->socklen };
+                failed = ngx_http_upstream_queue_failed_before(d, &one);
+            }
+            ngx_http_upstream_rr_peers_unlock(peers);
+            if (failed) {
+                pc->name = peers->name;
+                return NGX_BUSY;
+            }
+        }
+    }
     ngx_int_t rc = d->peer.get(pc, d->peer.data);
     if (!d->rr || !d->failed) return rc;
     /*
@@ -181,28 +205,6 @@ static void ngx_http_upstream_queue_post(ngx_http_upstream_queue_data_t *d) {
     if (!d->posted.posted) { ngx_post_event(&d->posted, &ngx_posted_events); }
 }
 
-static ngx_flag_t ngx_http_upstream_queue_spent(ngx_http_upstream_queue_data_t *d) {
-    /*
-     * The retry budget refresh_peer() just recomputed is gone although the
-     * request has made attempts: its peer set shrank under `resolve`
-     * while it waited. A request with no attempts yet is never spent - it
-     * may just be waiting for a name to resolve at all.
-     */
-    return d->used && d->request->upstream->peer.tries == 0;
-}
-
-static void ngx_http_upstream_queue_give_up(ngx_http_upstream_queue_data_t *d) {
-    /*
-     * Fail it as ngx_http_upstream_next() would once out of tries, rather
-     * than connect once more than proxy_next_upstream_tries allows - to
-     * the one peer left, which round-robin hands out tried or not.
-     */
-    ngx_http_request_t *r = d->request;
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "upstream queue: no tries left after the peer set changed");
-    ngx_http_upstream_queue_post(d);
-    ngx_http_upstream_finalize_request(r, r->upstream, NGX_HTTP_BAD_GATEWAY);
-}
-
 static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
@@ -222,10 +224,6 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
          * to fix what a real free-event should have fixed immediately.
          */
         ngx_http_upstream_queue_refresh_peer(d);
-        if (ngx_http_upstream_queue_spent(d)) {
-            ngx_http_upstream_queue_give_up(d);
-            continue;
-        }
         ngx_http_request_t *r = d->request;
         ngx_http_upstream_t *u = r->upstream;
         ngx_connection_t *c = u->peer.connection;
@@ -271,9 +269,7 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
             continue;
         }
         ngx_http_upstream_queue_refresh_peer(d);
-        if (!ngx_http_upstream_queue_spent(d)) break;
-        ngx_http_upstream_queue_unlink(d);
-        ngx_http_upstream_queue_give_up(d);
+        break;
     }
     if (!ngx_queue_empty(&qscf->queue)) {
         /*
@@ -550,6 +546,13 @@ static void ngx_http_upstream_queue_mark_failed(ngx_http_upstream_queue_data_t *
     ngx_http_upstream_rr_peers_unlock(peers);
 }
 
+static ngx_uint_t ngx_http_upstream_queue_budget(ngx_http_upstream_t *u) {
+    /* u->peer.tries right after peer.init, capped as ngx_http_upstream_init_request() does */
+    ngx_uint_t budget = u->peer.tries;
+    if (u->conf->next_upstream_tries && budget > u->conf->next_upstream_tries) budget = u->conf->next_upstream_tries;
+    return budget;
+}
+
 static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t *d) {
     /*
      * A queued request only got here because its balancer's peer.get()
@@ -608,14 +611,18 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
 #endif
     if (qscf->peer.init(r, uscf) == NGX_OK) {
         /*
-         * peer.init also resets u->peer.tries to the full peer count,
-         * as for a brand new request. Re-apply proxy_next_upstream_tries
-         * the way ngx_http_upstream_init_request() does, and take off
-         * the attempts this request has already made, so a queued
-         * request can't get a fresh retry budget on every refresh.
+         * peer.init also resets u->peer.tries to the full peer count, as
+         * for a brand new request. The request keeps the retry budget it
+         * started with (see peer_init()), minus the attempts it has made,
+         * so it can't get a fresh one on every refresh. The budget only
+         * grows - with a peer set that grew, e.g. a `resolve` name that
+         * had no addresses yet - and never shrinks: a name that briefly
+         * resolves to nothing, or to peers the request never tried, must
+         * not cost it the attempts it has left.
          */
-        if (u->conf->next_upstream_tries && u->peer.tries > u->conf->next_upstream_tries) u->peer.tries = u->conf->next_upstream_tries;
-        u->peer.tries = u->peer.tries > d->used ? u->peer.tries - d->used : 0;
+        ngx_uint_t budget = ngx_http_upstream_queue_budget(u);
+        if (budget > d->budget) d->budget = budget;
+        u->peer.tries = d->budget > d->used ? d->budget - d->used : 0;
         d->peer = u->peer;
         d->rr = ngx_http_upstream_queue_is_rr(d->peer.data, uscf);
         if (d->failed && d->rr) ngx_http_upstream_queue_mark_failed(d);
@@ -645,6 +652,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     u->conf->upstream = uscf;
     d->peer = u->peer;
     d->rr = ngx_http_upstream_queue_is_rr(d->peer.data, uscf);
+    d->budget = ngx_http_upstream_queue_budget(u);
     d->request = r;
     d->qscf = qscf;
     ngx_http_upstream_queue_set_hooks(u, d);
