@@ -92,6 +92,14 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
         ngx_uint_t tries = pc->tries;
         d->peer.free(pc, d->peer.data, 0);
         pc->tries = tries;
+        /*
+         * Forget the peer just handed back: on NGX_BUSY round-robin sets
+         * only pc->name, and a request queued with a stale pc->sockaddr
+         * would have that peer freed once more when it is finalized.
+         */
+        pc->sockaddr = NULL;
+        pc->socklen = 0;
+        pc->name = NULL;
         rc = d->peer.get(pc, d->peer.data);
     }
     return rc;

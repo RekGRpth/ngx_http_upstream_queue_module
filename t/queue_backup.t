@@ -51,7 +51,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(5);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(6);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the servers are written with their raw numbers below.
@@ -80,6 +80,13 @@ http {
         queue 5 timeout=3s;
     }
 
+    upstream stale {
+        server 127.0.0.1:8086 max_conns=1 max_fails=1 fail_timeout=10s;
+        server 127.0.0.1:8087 max_conns=1 max_fails=0 backup;
+        server 127.0.0.1:8088 max_conns=1 backup;
+        queue 5 timeout=2s;
+    }
+
     upstream backups {
         server 127.0.0.1:8083 max_conns=1;
         server 127.0.0.1:8084 max_fails=0 backup;
@@ -93,6 +100,11 @@ http {
 
         location / {
             proxy_pass http://backend;
+            proxy_read_timeout 20s;
+        }
+
+        location /stale/ {
+            proxy_pass http://stale;
             proxy_read_timeout 20s;
         }
 
@@ -110,6 +122,10 @@ $t->run_daemon(\&primary_backend, $a_port);
 $t->run_daemon(\&backup_backend, $c_port);
 $t->run_daemon(\&backup_backend, port(8083));
 $t->run_daemon(\&primary_backend, port(8085));
+$t->run_daemon(\&failing_once_backend, port(8086));
+$t->run_daemon(\&backup_backend, port(8088));
+$t->waitforsocket('127.0.0.1:' . port(8086)) or die "backend did not start\n";
+$t->waitforsocket('127.0.0.1:' . port(8088)) or die "backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . port(8083)) or die "backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . port(8085)) or die "backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . $a_port)
@@ -164,6 +180,30 @@ ok($elapsed < 2, 'served when A frees up, not at the queue timeout')
 		or diag("X-Upstream-Addr: $addr");
 
 	read_response($h2, 3);
+}
+
+# Third upstream: H1 holds the primary P and fails after 1s, H2 holds the
+# backup B2; nothing listens on the backup B1 yet, so R fails on it and
+# queues.  H1's failure disables P and drains the queue: R's retry turns
+# B1 away and finds B2 busy - and that BUSY used to leave R with B1 as
+# its u->peer.sockaddr.  R then timed out, and finalizing it freed B1 a
+# second time, wrapping its conns counter: with max_conns=1, B1 counted
+# as busy for good.  Once B1 is up, a later request Q must get it.
+
+{
+	my $h1 = send_request('/stale/H1');
+	select(undef, undef, undef, 0.2);
+	my $h2 = send_request('/stale/H2');
+	select(undef, undef, undef, 0.2);
+
+	read_response(send_request('/stale/R'), 4);
+
+	$t->run_daemon(\&primary_backend, port(8087));
+	$t->waitforsocket('127.0.0.1:' . port(8087))
+		or die "backend did not start\n";
+
+	like(read_response(send_request('/stale/Q'), 5), qr!^HTTP/1\.[01] 200 !,
+		'stale: a backup turned away from a queued request stays usable');
 }
 
 ###############################################################################
@@ -226,6 +266,29 @@ sub primary_backend {
 		}
 
 		$client->syswrite("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+		$client->close();
+	}
+}
+
+# Accepts the first request and closes it after 1s without answering.
+
+sub failing_once_backend {
+	my ($port) = @_;
+
+	my $server = IO::Socket::INET->new(
+		Proto => 'tcp',
+		LocalAddr => "127.0.0.1:$port",
+		Listen => 5,
+		Reuse => 1,
+	) or die "Can't create backend listening socket: $!\n";
+
+	while (my $client = $server->accept()) {
+
+		# waitforsocket()'s probe sends nothing and just closes.
+
+		next unless $client->sysread(my $buf, 65536);
+
+		select(undef, undef, undef, 1);
 		$client->close();
 	}
 }
