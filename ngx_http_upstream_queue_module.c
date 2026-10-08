@@ -67,6 +67,9 @@ static ngx_flag_t ngx_http_upstream_queue_is_rr(void *data, ngx_http_upstream_sr
      * declared before "queue" (a request pointer) - has something else at
      * that spot. Only valid right after peer.init: round-robin's peer.get
      * moves ->peers on to the backup set once the primary one is spent.
+     * This reads a balancer's private data, so a third-party one whose
+     * peer data is smaller than that, or happens to keep the upstream's
+     * peer set pointer at that very spot, would fool it.
      */
     return data && ((ngx_http_upstream_rr_peer_data_t *) data)->peers == uscf->peer.data;
 }
@@ -267,29 +270,32 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, "queue retry");
     ngx_http_upstream_queue_srv_conf_t *qscf = e->data;
-    while (!ngx_queue_empty(&qscf->queue)) {
-        ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
+    /*
+     * Unlike peer_free()'s drain, nothing here guarantees a slot actually
+     * freed up - this fires on a plain timer. Popping the head and
+     * reconnecting unconditionally (as peer_free() safely does, because
+     * it is only called right after a slot really did free up) would, on
+     * every tick where nothing changed, requeue the head request at the
+     * tail - breaking FIFO order for no reason. So probe the underlying
+     * peer first, with a clean rollback, and only actually touch the
+     * queue when it would truly succeed.
+     *
+     * The head may be unable to use the very peer that is free, because
+     * it already failed on it, while a request behind it could. So as
+     * long as the request probed has peers of its own to avoid, go on to
+     * the next one, and move the first that can connect to the head. A
+     * request with none sees what everyone behind it would: stop there.
+     */
+    ngx_uint_t n = qscf->size;
+    ngx_queue_t *q = ngx_queue_head(&qscf->queue);
+    while (q != ngx_queue_sentinel(&qscf->queue) && n--) {
+        ngx_http_upstream_queue_data_t *d = ngx_queue_data(q, ngx_http_upstream_queue_data_t, queue);
+        q = ngx_queue_next(q);
         if (ngx_http_upstream_queue_finalized(d)) {
             ngx_http_upstream_queue_unlink(d);
             continue;
         }
         ngx_http_upstream_queue_refresh_peer(d);
-        break;
-    }
-    if (!ngx_queue_empty(&qscf->queue)) {
-        /*
-         * Unlike peer_free()'s drain, nothing here guarantees a slot
-         * actually freed up - this fires on a plain timer. Popping the
-         * head and reconnecting unconditionally (as peer_free() safely
-         * does, because it is only called right after a slot really
-         * did free up) would, on every tick where nothing changed,
-         * requeue the head request at the tail with fresh timers -
-         * breaking FIFO order and resetting its deadline for no reason.
-         * So probe the underlying peer first, with a clean rollback,
-         * and only actually touch the queue when it would truly
-         * succeed.
-         */
-        ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
         ngx_peer_connection_t probe;
         ngx_memzero(&probe, sizeof(ngx_peer_connection_t));
         probe.log = e->log;
@@ -299,12 +305,18 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
              * The probe's peer.get() marked the peer it picked in this
              * request's rrp->tried, and peer.free() doesn't clear it - left
              * alone, it would keep this very request off the peer the probe
-             * just found free. drain() pops this same request first and
-             * starts its balancer data over before connecting, which takes
-             * care of that.
+             * just found free. drain() pops this request first and starts
+             * its balancer data over before connecting, which takes care of
+             * that.
              */
+            if (&d->queue != ngx_queue_head(&qscf->queue)) {
+                ngx_queue_remove(&d->queue);
+                ngx_queue_insert_head(&qscf->queue, &d->queue);
+            }
             ngx_http_upstream_queue_drain(qscf);
+            break;
         }
+        if (!d->failed || !d->failed->nelts) break;
     }
     ngx_http_upstream_queue_retry_schedule(qscf);
 }
