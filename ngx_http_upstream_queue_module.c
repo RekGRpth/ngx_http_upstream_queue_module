@@ -21,6 +21,7 @@ typedef struct {
     ngx_event_t connect_timeout;
     ngx_event_t timeout;
     ngx_http_request_t *request;
+    ngx_http_upstream_queue_srv_conf_t *qscf;
     ngx_peer_connection_t peer;
     ngx_queue_t queue;
     ngx_uint_t used;
@@ -32,6 +33,34 @@ typedef struct {
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e);
 static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t *d);
 static void ngx_http_upstream_queue_remember_failed(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc);
+
+static ngx_flag_t ngx_http_upstream_queue_finalized(ngx_http_upstream_queue_data_t *d) {
+    /*
+     * ngx_http_upstream_finalize_request() clears u->cleanup first thing.
+     * A queued request can be finalized while d lives on: a subrequest
+     * (SSI include, auth_request, mirror) shares the main request's pool,
+     * so the pool cleanup that takes d out of the queue only runs once
+     * the main request is done. Such a d must just be dropped from the
+     * queue - its upstream, placeholder connection included, is gone.
+     */
+    return d->request->upstream->cleanup == NULL;
+}
+
+static void ngx_http_upstream_queue_unlink(ngx_http_upstream_queue_data_t *d) {
+    if (!ngx_queue_empty(&d->queue)) {
+        ngx_queue_remove(&d->queue);
+        /*
+         * Back to the self-referential "empty" state, so a second unlink
+         * of the same d (e.g. the pool cleanup after the timeout handler,
+         * or a cleanup handler registered once per queueing) is a no-op
+         * instead of a removal through dangling next/prev pointers.
+         */
+        ngx_queue_init(&d->queue);
+        d->qscf->size--;
+    }
+    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
+    if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
+}
 
 static void ngx_http_upstream_queue_retry_schedule(ngx_http_upstream_queue_srv_conf_t *qscf) {
     if (ngx_queue_empty(&qscf->queue) || qscf->retry.timer_set) return;
@@ -58,13 +87,10 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
     if (qscf->draining) { qscf->reentered = 1; return; }
     qscf->draining = 1;
     while (!ngx_queue_empty(&qscf->queue)) {
-        ngx_queue_t *q = ngx_queue_head(&qscf->queue);
-        ngx_queue_remove(q);
-        qscf->size--;
-        ngx_http_upstream_queue_data_t *d = ngx_queue_data(q, ngx_http_upstream_queue_data_t, queue);
-        if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
-        if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
-        ngx_queue_init(&d->queue);
+        ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
+        ngx_http_upstream_queue_unlink(d);
+        /* already finalized while queued: nothing to connect, slot still free */
+        if (ngx_http_upstream_queue_finalized(d)) continue;
         /*
          * Refresh this request's balancer data before retrying it, not
          * just when the retry timer's own probe does it: this drain loop
@@ -122,6 +148,11 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, "queue retry");
     ngx_http_upstream_queue_srv_conf_t *qscf = e->data;
+    while (!ngx_queue_empty(&qscf->queue)) {
+        ngx_http_upstream_queue_data_t *d = ngx_queue_data(ngx_queue_head(&qscf->queue), ngx_http_upstream_queue_data_t, queue);
+        if (!ngx_http_upstream_queue_finalized(d)) break;
+        ngx_http_upstream_queue_unlink(d);
+    }
     if (!ngx_queue_empty(&qscf->queue)) {
         /*
          * Unlike peer_free()'s drain, nothing here guarantees a slot
@@ -177,40 +208,30 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
     ngx_http_upstream_queue_data_t *d = data;
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, d->request->connection->log, 0, "%s", __func__);
-    if (!ngx_queue_empty(&d->queue)) {
-        ngx_http_upstream_t *u = d->request->upstream;
-        ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
-        ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-        ngx_queue_remove(&d->queue);
-        qscf->size--;
-        /*
-         * A single request can register this cleanup handler more
-         * than once - each connect attempt that lands back in
-         * peer_get()'s "still busy, queue it" branch adds another
-         * ngx_pool_cleanup_t for the same d, e.g. on a retry after the
-         * request was already queued once. Without resetting d->queue
-         * to the self-referential "empty" state here (as
-         * ngx_http_upstream_queue_drain() already does after its own
-         * ngx_queue_remove()), a second invocation of this handler for
-         * the same d would see stale, dangling next/prev pointers,
-         * misread ngx_queue_empty() as false, and attempt a second,
-         * invalid removal through them.
-         */
-        ngx_queue_init(&d->queue);
-    }
-    if (d->connect_timeout.timer_set) ngx_del_timer(&d->connect_timeout);
-    if (d->timeout.timer_set) ngx_del_timer(&d->timeout);
+    /*
+     * A single request can register this cleanup handler more than once -
+     * each connect attempt that lands back in peer_get()'s "still busy,
+     * queue it" branch adds another ngx_pool_cleanup_t for the same d -
+     * which unlink() is safe against.
+     */
+    ngx_http_upstream_queue_unlink(d);
 }
 
 static void ngx_http_upstream_queue_connect_timeout_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, e->write ? "write" : "read");
-    ngx_connection_t *c = e->data;
-    if (c->write->timer_set) ngx_del_timer(c->write);
+    ngx_http_upstream_queue_data_t *d = e->data;
+    /* finalized: the placeholder is closed, and its slot may be someone else's by now */
+    if (ngx_http_upstream_queue_finalized(d)) { ngx_http_upstream_queue_unlink(d); return; }
+    ngx_connection_t *c = d->request->upstream->peer.connection;
+    if (c && c->write->timer_set) ngx_del_timer(c->write);
 }
 
 static void ngx_http_upstream_queue_timeout_handler(ngx_event_t *e) {
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, e->log, 0, e->write ? "write" : "read");
-    ngx_http_request_t *r = e->data;
+    ngx_http_upstream_queue_data_t *d = e->data;
+    ngx_http_upstream_queue_unlink(d);
+    if (ngx_http_upstream_queue_finalized(d)) return;
+    ngx_http_request_t *r = d->request;
     ngx_connection_t *c = r->connection;
     ngx_log_error(NGX_LOG_ERR, e->log, 0, "upstream queue timed out");
     ngx_http_upstream_t *u = r->upstream;
@@ -277,12 +298,12 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     cln->handler = ngx_http_upstream_queue_cleanup_handler;
     cln->data = d;
     if (u->conf->connect_timeout <= qscf->timeout) {
-        d->connect_timeout.data = pc->connection;
+        d->connect_timeout.data = d;
         d->connect_timeout.handler = ngx_http_upstream_queue_connect_timeout_handler;
         d->connect_timeout.log = pc->log;
         ngx_add_timer(&d->connect_timeout, u->conf->connect_timeout / 2);
     }
-    d->timeout.data = r;
+    d->timeout.data = d;
     d->timeout.handler = ngx_http_upstream_queue_timeout_handler;
     d->timeout.log = pc->log;
     /*
@@ -453,6 +474,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     u->conf->upstream = uscf;
     d->peer = u->peer;
     d->request = r;
+    d->qscf = qscf;
     u->peer.data = d;
     u->peer.free = ngx_http_upstream_queue_peer_free;
     u->peer.get = ngx_http_upstream_queue_peer_get;
