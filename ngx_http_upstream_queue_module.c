@@ -26,6 +26,7 @@ typedef struct {
     ngx_queue_t queue;
     ngx_uint_t used;
     ngx_array_t *failed;
+    ngx_flag_t rr;
     ngx_flag_t deadline_set;
     ngx_msec_t deadline;
 } ngx_http_upstream_queue_data_t;
@@ -44,6 +45,23 @@ static ngx_flag_t ngx_http_upstream_queue_finalized(ngx_http_upstream_queue_data
      * queue - its upstream, placeholder connection included, is gone.
      */
     return d->request->upstream->cleanup == NULL;
+}
+
+static ngx_flag_t ngx_http_upstream_queue_is_rr(void *data, ngx_http_upstream_srv_conf_t *uscf) {
+    /*
+     * Whether a balancer's freshly initialized peer data is round-robin's,
+     * which queue_detect_all_peer_down scans and mark_failed() marks:
+     * round-robin itself and every balancer built on it (least_conn,
+     * least_time, ip_hash, hash, random) start their peer data with
+     * ngx_http_upstream_rr_peer_data_t, set up by
+     * ngx_http_upstream_init_round_robin_peer(), which points ->peers at
+     * the upstream's peer set, uscf->peer.data. Anything else - the
+     * third-party fair (a peer index there), or a wrapper such as sticky
+     * declared before "queue" (a request pointer) - has something else at
+     * that spot. Only valid right after peer.init: round-robin's peer.get
+     * moves ->peers on to the backup set once the primary one is spent.
+     */
+    return data && ((ngx_http_upstream_rr_peer_data_t *) data)->peers == uscf->peer.data;
 }
 
 static void ngx_http_upstream_queue_unlink(ngx_http_upstream_queue_data_t *d) {
@@ -258,12 +276,11 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
     /*
      * Detection scans the peer data as round-robin's, which only holds
-     * for balancers built on it - round-robin itself, least_conn,
-     * ip_hash, hash and random, all of which keep its peer.free. With
-     * any other (e.g. the third-party fair), the scan would read some
-     * other structure: skip it there, as if detection were off.
+     * for balancers built on it (see is_rr()). With any other, the scan
+     * would read some other structure: skip it there, as if detection
+     * were off.
      */
-    if (qscf->detect && d->peer.free != ngx_http_upstream_free_round_robin_peer) {
+    if (qscf->detect && !d->rr) {
         if (!qscf->detect_warned) {
             ngx_log_error(NGX_LOG_WARN, pc->log, 0, "queue_detect_all_peer_down is ignored: the load balancing method is not based on round-robin");
             qscf->detect_warned = 1;
@@ -402,7 +419,7 @@ static ngx_flag_t ngx_http_upstream_queue_rr_stale(ngx_http_upstream_rr_peers_t 
 
 static void ngx_http_upstream_queue_mark_failed(ngx_http_upstream_queue_data_t *d) {
     /*
-     * Only called for balancers built on round-robin (see peer_get()),
+     * Only called for balancers built on round-robin (see is_rr()),
      * whose peer data starts with ngx_http_upstream_rr_peer_data_t and
      * whose peer.get skips peers set in rrp->tried. Peers are matched by
      * address, not index, so this holds across `resolve` updates; if
@@ -495,7 +512,8 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
         if (u->conf->next_upstream_tries && u->peer.tries > u->conf->next_upstream_tries) u->peer.tries = u->conf->next_upstream_tries;
         u->peer.tries = u->peer.tries > d->used ? u->peer.tries - d->used : 0;
         d->peer = u->peer;
-        if (d->failed && d->peer.free == ngx_http_upstream_free_round_robin_peer) ngx_http_upstream_queue_mark_failed(d);
+        d->rr = ngx_http_upstream_queue_is_rr(d->peer.data, uscf);
+        if (d->failed && d->rr) ngx_http_upstream_queue_mark_failed(d);
     }
     if (outer.data == d) {
         ngx_http_upstream_queue_set_hooks(u, d);
@@ -521,6 +539,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     ngx_http_upstream_t *u = r->upstream;
     u->conf->upstream = uscf;
     d->peer = u->peer;
+    d->rr = ngx_http_upstream_queue_is_rr(d->peer.data, uscf);
     d->request = r;
     d->qscf = qscf;
     ngx_http_upstream_queue_set_hooks(u, d);
