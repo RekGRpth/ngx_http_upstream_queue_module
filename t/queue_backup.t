@@ -51,7 +51,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(6);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(8);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the servers are written with their raw numbers below.
@@ -80,6 +80,12 @@ http {
         queue 5 timeout=3s;
     }
 
+    upstream lf {
+        server 127.0.0.1:8089 max_conns=1;
+        server 127.0.0.1:8090 max_fails=2 fail_timeout=1s backup;
+        queue 5 timeout=5s;
+    }
+
     upstream stale {
         server 127.0.0.1:8086 max_conns=1 max_fails=1 fail_timeout=10s;
         server 127.0.0.1:8087 max_conns=1 max_fails=0 backup;
@@ -103,6 +109,12 @@ http {
             proxy_read_timeout 20s;
         }
 
+        location /lf/ {
+            proxy_pass http://lf;
+            proxy_read_timeout 20s;
+            add_header X-Upstream-Addr \$upstream_addr always;
+        }
+
         location /stale/ {
             proxy_pass http://stale;
             proxy_read_timeout 20s;
@@ -123,6 +135,8 @@ $t->run_daemon(\&backup_backend, $c_port);
 $t->run_daemon(\&backup_backend, port(8083));
 $t->run_daemon(\&primary_backend, port(8085));
 $t->run_daemon(\&failing_once_backend, port(8086));
+$t->run_daemon(\&backup_backend, port(8089));
+$t->waitforsocket('127.0.0.1:' . port(8089)) or die "backend did not start\n";
 $t->run_daemon(\&backup_backend, port(8088));
 $t->waitforsocket('127.0.0.1:' . port(8086)) or die "backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . port(8088)) or die "backend did not start\n";
@@ -204,6 +218,36 @@ ok($elapsed < 2, 'served when A frees up, not at the queue timeout')
 
 	like(read_response(send_request('/stale/Q'), 5), qr!^HTTP/1\.[01] 200 !,
 		'stale: a backup turned away from a queued request stays usable');
+}
+
+# Fourth upstream: H holds the primary for good; nothing listens on the
+# only backup B1 (max_fails=2, fail_timeout=1s).  R fails on B1 (fails=1)
+# and queues.  Once B1's fail_timeout is up, each retry tick has
+# round-robin pick B1 to re-check it, and R turns it away - which used to
+# count as a check that passed and reset B1's fails to 0.  Then Z1 fails
+# on B1 too: with fails reset that is only 1 of 2, and Z2 went straight to
+# B1 as well; without, it is 2 of 2, B1 is disabled for a second, and Z2
+# stays off it.  Only Z2's first attempt matters, so the error log is
+# checked right away, while B1 is still disabled.
+
+{
+	my $h = send_request('/lf/H');
+	select(undef, undef, undef, 0.2);
+	my $r = send_request('/lf/R');
+	select(undef, undef, undef, 1.8);
+
+	my $z1 = send_request('/lf/Z1');
+	select(undef, undef, undef, 0.2);
+	my $z2 = send_request('/lf/Z2');
+	select(undef, undef, undef, 0.4);
+
+	my $log = $t->read_file('error.log');
+
+	like($log, qr/connect\(\) failed.*"GET \/lf\/Z1 /,
+		'lf: Z1 failed on B1');
+	unlike($log, qr/connect\(\) failed.*"GET \/lf\/Z2 /,
+		'lf: turning a peer away from a queued request does not count '
+		. 'as a passed check');
 }
 
 ###############################################################################

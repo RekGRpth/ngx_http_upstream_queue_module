@@ -82,13 +82,31 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
      * moves on to the backup set - which every retry out of the queue
      * makes it do again - so a backup it failed on can come back here.
      * Hand such a peer straight back and ask again: round-robin has
-     * marked it tried by now, so it won't return it twice, except a
-     * single peer, which it never marks; hence the bound, after which
-     * the peer is taken and the retry budget decides. The free can
-     * count as a check that passed for a peer being re-probed after
-     * fail_timeout - the price of not re-trying one that already failed.
+     * marked it tried by now, so it won't return it twice. A single peer
+     * it hands out tried or not, and its free resets the peer's fails
+     * unconditionally, so that one is left alone here.
      */
-    for (ngx_uint_t n = 0; rc == NGX_OK && n < d->failed->nelts && ngx_http_upstream_queue_failed_before(d, pc); n++) {
+    ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
+    for (ngx_uint_t n = 0; rc == NGX_OK && !rrp->peers->single && n < d->failed->nelts && ngx_http_upstream_queue_failed_before(d, pc); n++) {
+#if !defined ngx_http_upstream_conf_changed
+        /*
+         * peer.get may just have picked this peer to re-check it after
+         * fail_timeout (setting peer->checked), and a free without
+         * NGX_PEER_FAILED then counts as a check that passed, resetting
+         * its fails - although nothing was sent to it. Put checked back
+         * to the time of the last failure first, as if it had not been
+         * picked, so the next request re-checks it for real. (Angie,
+         * told apart by its ngx_http_upstream_conf_changed(), only counts
+         * a check as passed when there was a connection, which a peer
+         * handed back here never has.)
+         */
+        ngx_http_upstream_rr_peer_t *peer = rrp->current;
+        ngx_http_upstream_rr_peers_rlock(rrp->peers);
+        ngx_http_upstream_rr_peer_lock(rrp->peers, peer);
+        peer->checked = peer->accessed;
+        ngx_http_upstream_rr_peer_unlock(rrp->peers, peer);
+        ngx_http_upstream_rr_peers_unlock(rrp->peers);
+#endif
         ngx_uint_t tries = pc->tries;
         d->peer.free(pc, d->peer.data, 0);
         pc->tries = tries;
