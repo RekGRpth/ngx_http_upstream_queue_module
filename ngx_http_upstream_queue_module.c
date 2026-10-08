@@ -352,6 +352,27 @@ static void ngx_http_upstream_queue_peer_save_session(ngx_peer_connection_t *pc,
 }
 #endif
 
+static void ngx_http_upstream_queue_peer_notify(ngx_peer_connection_t *pc, void *data, ngx_uint_t type) {
+    ngx_http_upstream_queue_data_t *d = data;
+    d->peer.notify(pc, d->peer.data, type);
+}
+
+static void ngx_http_upstream_queue_set_hooks(ngx_http_upstream_t *u, ngx_http_upstream_queue_data_t *d) {
+    u->peer.data = d;
+    u->peer.get = ngx_http_upstream_queue_peer_get;
+    u->peer.free = ngx_http_upstream_queue_peer_free;
+#if (NGX_HTTP_SSL)
+    u->peer.set_session = ngx_http_upstream_queue_peer_set_session;
+    u->peer.save_session = ngx_http_upstream_queue_peer_save_session;
+#endif
+    /*
+     * nginx calls notify with u->peer.data, i.e. ours: pass it on with
+     * the wrapped balancer's own data (sticky's "learn ... header" sets
+     * one), or leave it unset like the balancer did.
+     */
+    u->peer.notify = d->peer.notify ? ngx_http_upstream_queue_peer_notify : NULL;
+}
+
 static void ngx_http_upstream_queue_remember_failed(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
     ngx_pool_t *pool = d->request->pool;
     if (!d->failed && !(d->failed = ngx_array_create(pool, 2, sizeof(ngx_addr_t)))) return;
@@ -440,7 +461,22 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
     ngx_http_upstream_t *u = r->upstream;
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
-    u->peer.data = d->peer.data;
+    /*
+     * Hand peer.init the same u->peer a brand new request has: no hooks,
+     * and no data - except plain round-robin's own, which its peer.init
+     * reuses in place instead of allocating anew. Anything else would
+     * be misread: a wrapper such as sticky passes u->peer.data straight
+     * to round-robin, and records the hooks it finds as the "original"
+     * ones - ours from the last round, looping notify back into itself.
+     */
+    u->peer.data = d->peer.get == ngx_http_upstream_get_round_robin_peer ? d->peer.data : NULL;
+    u->peer.get = NULL;
+    u->peer.free = NULL;
+    u->peer.notify = NULL;
+#if (NGX_HTTP_SSL)
+    u->peer.set_session = NULL;
+    u->peer.save_session = NULL;
+#endif
     if (qscf->peer.init(r, uscf) == NGX_OK) {
         /*
          * peer.init also resets u->peer.tries to the full peer count,
@@ -454,13 +490,7 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
         d->peer = u->peer;
         if (d->failed && d->peer.free == ngx_http_upstream_free_round_robin_peer) ngx_http_upstream_queue_mark_failed(d);
     }
-    u->peer.data = d;
-    u->peer.get = ngx_http_upstream_queue_peer_get;
-    u->peer.free = ngx_http_upstream_queue_peer_free;
-#if (NGX_HTTP_SSL)
-    u->peer.save_session = ngx_http_upstream_queue_peer_save_session;
-    u->peer.set_session = ngx_http_upstream_queue_peer_set_session;
-#endif
+    ngx_http_upstream_queue_set_hooks(u, d);
 }
 
 static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *uscf) {
@@ -475,13 +505,7 @@ static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_ht
     d->peer = u->peer;
     d->request = r;
     d->qscf = qscf;
-    u->peer.data = d;
-    u->peer.free = ngx_http_upstream_queue_peer_free;
-    u->peer.get = ngx_http_upstream_queue_peer_get;
-#if (NGX_HTTP_SSL)
-    u->peer.save_session = ngx_http_upstream_queue_peer_save_session;
-    u->peer.set_session = ngx_http_upstream_queue_peer_set_session;
-#endif
+    ngx_http_upstream_queue_set_hooks(u, d);
     return NGX_OK;
 }
 
