@@ -462,6 +462,13 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
     ngx_http_upstream_srv_conf_t *uscf = u->conf->upstream;
     ngx_http_upstream_queue_srv_conf_t *qscf = ngx_http_conf_upstream_srv_conf(uscf, ngx_http_upstream_queue_module);
     /*
+     * u->peer is ours only if nothing wraps the queue. A wrapper set up
+     * around it per request - keepalive, which nginx 1.29.7+ always puts
+     * outside, or one declared after "queue" - keeps its own data and
+     * hooks there, with ours tucked inside it, and must keep them.
+     */
+    ngx_peer_connection_t outer = u->peer;
+    /*
      * Hand peer.init the same u->peer a brand new request has: no hooks,
      * and no data - except plain round-robin's own, which its peer.init
      * reuses in place instead of allocating anew. Anything else would
@@ -490,7 +497,18 @@ static void ngx_http_upstream_queue_refresh_peer(ngx_http_upstream_queue_data_t 
         d->peer = u->peer;
         if (d->failed && d->peer.free == ngx_http_upstream_free_round_robin_peer) ngx_http_upstream_queue_mark_failed(d);
     }
-    ngx_http_upstream_queue_set_hooks(u, d);
+    if (outer.data == d) {
+        ngx_http_upstream_queue_set_hooks(u, d);
+        return;
+    }
+    u->peer.data = outer.data;
+    u->peer.get = outer.get;
+    u->peer.free = outer.free;
+    u->peer.notify = outer.notify;
+#if (NGX_HTTP_SSL)
+    u->peer.set_session = outer.set_session;
+    u->peer.save_session = outer.save_session;
+#endif
 }
 
 static ngx_int_t ngx_http_upstream_queue_peer_init(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *uscf) {

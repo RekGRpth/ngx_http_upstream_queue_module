@@ -16,7 +16,8 @@
 #   - R waits in the queue, then connects once the holder is done.
 # Expected: R was queued (the upstream name shows up in $upstream_addr)
 # and its handshake resumed the session ($ssl_session_reused on the TLS
-# side is "r").
+# side is "r").  Upstream keepalive is kept out of the way, or R would just
+# reuse a cached connection and not handshake at all.
 
 ###############################################################################
 
@@ -99,6 +100,11 @@ http {
 
         add_header X-Upstream-Addr \$upstream_addr always;
         proxy_ssl_session_reuse on;
+
+        # no upstream keepalive (on by default since nginx 1.29.7): every
+        # request must open a connection of its own, so that its handshake
+        # shows whether the session was resumed
+        proxy_set_header Connection close;
         proxy_read_timeout 5s;
 
         location /plain/ {
