@@ -65,6 +65,38 @@ static ngx_flag_t ngx_http_upstream_queue_is_rr(void *data, ngx_http_upstream_sr
     return data && ((ngx_http_upstream_rr_peer_data_t *) data)->peers == uscf->peer.data;
 }
 
+static ngx_flag_t ngx_http_upstream_queue_failed_before(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
+    ngx_addr_t *failed = d->failed->elts;
+    for (ngx_uint_t i = 0; i < d->failed->nelts; i++) {
+        if (ngx_cmp_sockaddr(failed[i].sockaddr, failed[i].socklen, pc->sockaddr, pc->socklen, 1) == NGX_OK) return 1;
+    }
+    return 0;
+}
+
+static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
+    ngx_int_t rc = d->peer.get(pc, d->peer.data);
+    if (!d->rr || !d->failed) return rc;
+    /*
+     * mark_failed() keeps a refreshed request off the primary peers it
+     * already failed on, but round-robin clears rrp->tried whenever it
+     * moves on to the backup set - which every retry out of the queue
+     * makes it do again - so a backup it failed on can come back here.
+     * Hand such a peer straight back and ask again: round-robin has
+     * marked it tried by now, so it won't return it twice, except a
+     * single peer, which it never marks; hence the bound, after which
+     * the peer is taken and the retry budget decides. The free can
+     * count as a check that passed for a peer being re-probed after
+     * fail_timeout - the price of not re-trying one that already failed.
+     */
+    for (ngx_uint_t n = 0; rc == NGX_OK && n < d->failed->nelts && ngx_http_upstream_queue_failed_before(d, pc); n++) {
+        ngx_uint_t tries = pc->tries;
+        d->peer.free(pc, d->peer.data, 0);
+        pc->tries = tries;
+        rc = d->peer.get(pc, d->peer.data);
+    }
+    return rc;
+}
+
 static void ngx_http_upstream_queue_unlink(ngx_http_upstream_queue_data_t *d) {
     if (!ngx_queue_empty(&d->queue)) {
         ngx_queue_remove(&d->queue);
@@ -199,7 +231,7 @@ static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
         ngx_peer_connection_t probe;
         ngx_memzero(&probe, sizeof(ngx_peer_connection_t));
         probe.log = e->log;
-        if (d->peer.get(&probe, d->peer.data) == NGX_OK) {
+        if (ngx_http_upstream_queue_get(d, &probe) == NGX_OK) {
             d->peer.free(&probe, d->peer.data, 0);
             /*
              * The probe's peer.get() marked the peer it picked in this
@@ -278,7 +310,7 @@ static void ngx_http_upstream_queue_timeout_handler(ngx_event_t *e) {
 static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, void *data) {
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "%s", __func__);
     ngx_http_upstream_queue_data_t *d = data;
-    ngx_int_t rc = d->peer.get(pc, d->peer.data);
+    ngx_int_t rc = ngx_http_upstream_queue_get(d, pc);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
     if (rc != NGX_BUSY) { d->deadline_set = 0; return rc; }
     ngx_http_request_t *r = d->request;
@@ -436,8 +468,9 @@ static void ngx_http_upstream_queue_mark_failed(ngx_http_upstream_queue_data_t *
      * address, not index, so this holds across `resolve` updates; if
      * the peer set changed since peer.init sized rrp->tried, leave it -
      * peer.get won't use this stale snapshot anyway. Only the primary
-     * set is marked: round-robin clears rrp->tried itself when it moves
-     * on to the backup set, as it would without the queue.
+     * set can be marked here: round-robin clears rrp->tried when it
+     * moves on to the backup set, so ngx_http_upstream_queue_get() turns
+     * away backups failed on before as they come up.
      */
     ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
     ngx_http_upstream_rr_peers_t *peers = rrp->peers;

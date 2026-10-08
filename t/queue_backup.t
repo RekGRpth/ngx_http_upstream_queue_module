@@ -51,7 +51,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(3);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(5);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the servers are written with their raw numbers below.
@@ -80,6 +80,13 @@ http {
         queue 5 timeout=3s;
     }
 
+    upstream backups {
+        server 127.0.0.1:8083 max_conns=1;
+        server 127.0.0.1:8084 max_fails=0 backup;
+        server 127.0.0.1:8085 max_conns=1 backup;
+        queue 5 timeout=5s;
+    }
+
     server {
         listen       127.0.0.1:8080;
         server_name  localhost;
@@ -88,6 +95,12 @@ http {
             proxy_pass http://backend;
             proxy_read_timeout 20s;
         }
+
+        location /backups/ {
+            proxy_pass http://backups;
+            proxy_read_timeout 20s;
+            add_header X-Upstream-Addr \$upstream_addr always;
+        }
     }
 }
 
@@ -95,6 +108,10 @@ EOF
 
 $t->run_daemon(\&primary_backend, $a_port);
 $t->run_daemon(\&backup_backend, $c_port);
+$t->run_daemon(\&backup_backend, port(8083));
+$t->run_daemon(\&primary_backend, port(8085));
+$t->waitforsocket('127.0.0.1:' . port(8083)) or die "backend did not start\n";
+$t->waitforsocket('127.0.0.1:' . port(8085)) or die "backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . $a_port)
 	or die "backend A did not start\n";
 $t->waitforsocket('127.0.0.1:' . $c_port)
@@ -121,6 +138,33 @@ like($resp, qr!^HTTP/1\.[01] 200 !,
 	or diag($resp =~ /^([^\r\n]*)/ ? $1 : '(no response)');
 ok($elapsed < 2, 'served when A frees up, not at the queue timeout')
 	or diag("elapsed: $elapsed");
+
+# Second upstream: H1 holds the primary for good, H2 a backup (B2) for
+# 1s; the other backup (B1) refuses every connection.  R fails on B1,
+# finds B2 busy and queues.  Once B2 frees up, R must get it - without
+# trying B1 again, although round-robin clears rrp->tried each time it
+# moves on to the backup set, which a retry from the queue makes it do
+# once more.
+
+{
+	my $h1 = send_request('/backups/H1');
+	select(undef, undef, undef, 0.2);
+	my $h2 = send_request('/backups/H2');
+	select(undef, undef, undef, 0.2);
+
+	my $resp = read_response(send_request('/backups/R'), 6);
+	my ($addr) = $resp =~ /^X-Upstream-Addr: ([^\r\n]*)/mi;
+	$addr //= '';
+	my $b1 = port(8084);
+	my $b1_tries = () = $addr =~ /:$b1\b/g;
+
+	like($resp, qr!^HTTP/1\.[01] 200 !, 'backups: R served by B2')
+		or diag("X-Upstream-Addr: $addr");
+	is($b1_tries, 1, 'backups: R does not retry the backup it failed on')
+		or diag("X-Upstream-Addr: $addr");
+
+	read_response($h2, 3);
+}
 
 ###############################################################################
 
