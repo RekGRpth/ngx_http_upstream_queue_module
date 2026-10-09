@@ -8,6 +8,8 @@ typedef struct {
     ngx_flag_t detect_warned;
     ngx_flag_t draining;
     ngx_flag_t reentered;
+    ngx_sockaddr_t freed;
+    socklen_t freed_len;
     ngx_http_upstream_peer_t peer;
     ngx_msec_t timeout;
     ngx_msec_t retry_interval;
@@ -84,10 +86,10 @@ static ngx_flag_t ngx_http_upstream_queue_is_rr(void *data, ngx_http_upstream_sr
     return data && ((ngx_http_upstream_rr_peer_data_t *) data)->peers == uscf->peer.data;
 }
 
-static ngx_flag_t ngx_http_upstream_queue_failed_before(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
+static ngx_flag_t ngx_http_upstream_queue_failed_before(ngx_http_upstream_queue_data_t *d, struct sockaddr *sockaddr, socklen_t socklen) {
     ngx_addr_t *failed = d->failed->elts;
     for (ngx_uint_t i = 0; i < d->failed->nelts; i++) {
-        if (ngx_cmp_sockaddr(failed[i].sockaddr, failed[i].socklen, pc->sockaddr, pc->socklen, 1) == NGX_OK) return 1;
+        if (ngx_cmp_sockaddr(failed[i].sockaddr, failed[i].socklen, sockaddr, socklen, 1) == NGX_OK) return 1;
     }
     return 0;
 }
@@ -151,8 +153,7 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
         /* single: one peer, and no backups either */
         ngx_flag_t failed = 0;
         if (peers->single && peers->peer) {
-            ngx_peer_connection_t one = { .sockaddr = peers->peer->sockaddr, .socklen = peers->peer->socklen };
-            failed = ngx_http_upstream_queue_failed_before(d, &one);
+            failed = ngx_http_upstream_queue_failed_before(d, peers->peer->sockaddr, peers->peer->socklen);
         }
         ngx_http_upstream_rr_peers_unlock(peers);
         if (failed) {
@@ -173,7 +174,7 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
      * unconditionally, so that one is left alone here.
      */
     ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
-    for (ngx_uint_t n = 0; rc == NGX_OK && !rrp->peers->single && n < d->failed->nelts && ngx_http_upstream_queue_failed_before(d, pc); n++) {
+    for (ngx_uint_t n = 0; rc == NGX_OK && !rrp->peers->single && n < d->failed->nelts && ngx_http_upstream_queue_failed_before(d, pc->sockaddr, pc->socklen); n++) {
         ngx_http_upstream_queue_hand_back(d, pc);
         rc = d->peer.get(pc, d->peer.data);
     }
@@ -268,11 +269,15 @@ static ngx_http_upstream_queue_data_t *ngx_http_upstream_queue_pick(ngx_http_ups
      * The queued request to try next, or NULL. Finalized ones are dropped
      * on the way. A request may not use peers it already failed on, so
      * the head can be unable to use the very peer that is free while one
-     * behind it could: a request with peers of its own to avoid is probed
-     * and passed over when nothing is left for it. One without is what
-     * everyone behind it would see. When a slot was really freed (drain()
-     * from peer_free()), it is taken as is; on the retry timer, where
-     * nothing guarantees a free slot, it is probed too, and the search
+     * behind it could, and is passed over then.
+     *
+     * When a slot was really freed (drain() from peer_free()), the peer
+     * is known: a request is taken as is unless it already failed on that
+     * very peer - no refresh, no probe, as this runs on every connection
+     * the upstream releases. On the retry timer, where nothing guarantees
+     * a free slot at all, a request with peers of its own to avoid is
+     * probed and passed over when nothing is left for it; one without is
+     * what everyone behind it would see, so it is probed and the search
      * ends with it either way.
      *
      * That holds as long as the balancer's choice doesn't hinge on the
@@ -293,7 +298,10 @@ static ngx_http_upstream_queue_data_t *ngx_http_upstream_queue_pick(ngx_http_ups
             continue;
         }
         ngx_flag_t avoid = d->failed && d->failed->nelts;
-        if (!probe && !avoid) return d;
+        if (!probe) {
+            if (avoid && qscf->freed_len && ngx_http_upstream_queue_failed_before(d, &qscf->freed.sockaddr, qscf->freed_len)) continue;
+            return d;
+        }
         ngx_http_upstream_queue_refresh_peer(d);
         if (ngx_http_upstream_queue_probe(d, log)) return d;
         if (!avoid) return NULL;
@@ -353,6 +361,7 @@ static void ngx_http_upstream_queue_drain(ngx_http_upstream_queue_srv_conf_t *qs
         if (!qscf->reentered) break;
     }
     qscf->draining = 0;
+    qscf->freed_len = 0;
 }
 
 static void ngx_http_upstream_queue_retry_handler(ngx_event_t *e) {
@@ -381,8 +390,16 @@ static void ngx_http_upstream_queue_peer_free(ngx_peer_connection_t *pc, void *d
      * again - re-running peer.init forgets them.
      */
     if (pc->sockaddr && (state & (NGX_PEER_FAILED|NGX_PEER_NEXT))) ngx_http_upstream_queue_remember_failed(d, pc);
+    /* which peer frees up, for pick() to match against the queue's failures */
+    ngx_http_upstream_queue_srv_conf_t *qscf = d->qscf;
+    if (pc->sockaddr && pc->socklen <= sizeof(ngx_sockaddr_t)) {
+        ngx_memcpy(&qscf->freed, pc->sockaddr, pc->socklen);
+        qscf->freed_len = pc->socklen;
+    } else {
+        qscf->freed_len = 0;
+    }
     d->peer.free(pc, d->peer.data, state);
-    ngx_http_upstream_queue_drain(d->qscf, NULL);
+    ngx_http_upstream_queue_drain(qscf, NULL);
 }
 
 static void ngx_http_upstream_queue_cleanup_handler(void *data) {
