@@ -283,11 +283,14 @@ static ngx_http_upstream_queue_data_t *ngx_http_upstream_queue_pick(ngx_http_ups
      *
      * That holds as long as the balancer's choice doesn't hinge on the
      * request beyond its failures. With Angie's sticky_strict it does: a
-     * request bound to a busy peer probes busy while one behind it, bound
-     * to a free one, could go. drain() still gets past it - it goes back
-     * to the tail - but a slot freed in another worker (a shared zone) is
-     * only found by the timer, which then waits on it. Probing the whole
-     * queue every tick would cost a refresh and a peer.get per request.
+     * request bound to a busy peer gets nothing while one behind it, bound
+     * to the free one, could go. drain() takes it as is; it finds nothing,
+     * goes back to the tail, and the slot waits for the next tick (up to
+     * retry_interval) to go to the next request. A slot freed in another
+     * worker (a shared zone) is only found by the timer, which probes the
+     * bound request busy and waits on it for as long as it stays queued.
+     * Probing the whole queue every tick would cost a refresh and a
+     * peer.get per request.
      */
     ngx_uint_t n = qscf->size;
     ngx_queue_t *q = ngx_queue_head(&qscf->queue);
