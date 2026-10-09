@@ -92,6 +92,51 @@ static ngx_flag_t ngx_http_upstream_queue_failed_before(ngx_http_upstream_queue_
     return 0;
 }
 
+static void ngx_http_upstream_queue_hand_back(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
+    /*
+     * Give a peer that peer.get returned back to the balancer, nothing
+     * having been sent to it: a probe's, or one the request already
+     * failed on.
+     */
+#if !defined ngx_http_upstream_conf_changed
+    ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
+    if (d->rr && !rrp->peers->single) {
+        /*
+         * peer.get may just have picked this peer to re-check it after
+         * fail_timeout (setting peer->checked), and a free without
+         * NGX_PEER_FAILED then counts as a check that passed, resetting
+         * its fails - although nothing was sent to it. Put checked back
+         * to the time of the last failure first, as if it had not been
+         * picked, so the next request re-checks it for real. If another
+         * request is re-checking it at this very moment, its mark is lost
+         * as well, and its success then won't clear the peer's fails -
+         * there is no telling the two apart. A single peer's fails don't
+         * matter: nginx never takes it out of service. (Angie, told apart
+         * by its ngx_http_upstream_conf_changed(), only counts a check as
+         * passed when there was a connection, which a peer handed back
+         * here never has.)
+         */
+        ngx_http_upstream_rr_peer_t *peer = rrp->current;
+        ngx_http_upstream_rr_peers_rlock(rrp->peers);
+        ngx_http_upstream_rr_peer_lock(rrp->peers, peer);
+        peer->checked = peer->accessed;
+        ngx_http_upstream_rr_peer_unlock(rrp->peers, peer);
+        ngx_http_upstream_rr_peers_unlock(rrp->peers);
+    }
+#endif
+    ngx_uint_t tries = pc->tries;
+    d->peer.free(pc, d->peer.data, 0);
+    pc->tries = tries;
+    /*
+     * Forget the peer just handed back: on NGX_BUSY round-robin sets
+     * only pc->name, and a request queued with a stale pc->sockaddr would
+     * have that peer freed once more when it is finalized.
+     */
+    pc->sockaddr = NULL;
+    pc->socklen = 0;
+    pc->name = NULL;
+}
+
 static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, ngx_peer_connection_t *pc) {
     if (d->rr && d->failed) {
         /*
@@ -129,39 +174,7 @@ static ngx_int_t ngx_http_upstream_queue_get(ngx_http_upstream_queue_data_t *d, 
      */
     ngx_http_upstream_rr_peer_data_t *rrp = d->peer.data;
     for (ngx_uint_t n = 0; rc == NGX_OK && !rrp->peers->single && n < d->failed->nelts && ngx_http_upstream_queue_failed_before(d, pc); n++) {
-#if !defined ngx_http_upstream_conf_changed
-        /*
-         * peer.get may just have picked this peer to re-check it after
-         * fail_timeout (setting peer->checked), and a free without
-         * NGX_PEER_FAILED then counts as a check that passed, resetting
-         * its fails - although nothing was sent to it. Put checked back
-         * to the time of the last failure first, as if it had not been
-         * picked, so the next request re-checks it for real. If another
-         * request is re-checking it at this very moment, its mark is lost
-         * as well, and its success then won't clear the peer's fails -
-         * there is no telling the two apart. (Angie,
-         * told apart by its ngx_http_upstream_conf_changed(), only counts
-         * a check as passed when there was a connection, which a peer
-         * handed back here never has.)
-         */
-        ngx_http_upstream_rr_peer_t *peer = rrp->current;
-        ngx_http_upstream_rr_peers_rlock(rrp->peers);
-        ngx_http_upstream_rr_peer_lock(rrp->peers, peer);
-        peer->checked = peer->accessed;
-        ngx_http_upstream_rr_peer_unlock(rrp->peers, peer);
-        ngx_http_upstream_rr_peers_unlock(rrp->peers);
-#endif
-        ngx_uint_t tries = pc->tries;
-        d->peer.free(pc, d->peer.data, 0);
-        pc->tries = tries;
-        /*
-         * Forget the peer just handed back: on NGX_BUSY round-robin sets
-         * only pc->name, and a request queued with a stale pc->sockaddr
-         * would have that peer freed once more when it is finalized.
-         */
-        pc->sockaddr = NULL;
-        pc->socklen = 0;
-        pc->name = NULL;
+        ngx_http_upstream_queue_hand_back(d, pc);
         rc = d->peer.get(pc, d->peer.data);
     }
     return rc;
@@ -246,7 +259,7 @@ static ngx_flag_t ngx_http_upstream_queue_probe(ngx_http_upstream_queue_data_t *
     probe.cached = 0;
     probe.log = log;
     if (ngx_http_upstream_queue_get(d, &probe) != NGX_OK) return 0;
-    d->peer.free(&probe, d->peer.data, 0);
+    ngx_http_upstream_queue_hand_back(d, &probe);
     return 1;
 }
 

@@ -51,7 +51,7 @@ if (!-e $module) {
 	Test::More::plan(skip_all => "$module not built");
 }
 
-my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(8);
+my $t = Test::Nginx->new()->has(qw/http proxy/)->plan(10);
 
 # 127.0.0.1:8NNN in nginx.conf is remapped by write_file_expand() itself,
 # so the servers are written with their raw numbers below.
@@ -78,6 +78,12 @@ http {
         server 127.0.0.1:8081 max_conns=1;
         server 127.0.0.1:8082 max_conns=1 backup;
         queue 5 timeout=3s;
+    }
+
+    upstream pr {
+        server 127.0.0.1:8091 max_conns=1;
+        server 127.0.0.1:8092 max_fails=2 fail_timeout=1s backup;
+        queue 5 timeout=6s;
     }
 
     upstream lf {
@@ -109,6 +115,11 @@ http {
             proxy_read_timeout 20s;
         }
 
+        location /pr/ {
+            proxy_pass http://pr;
+            proxy_read_timeout 20s;
+        }
+
         location /lf/ {
             proxy_pass http://lf;
             proxy_read_timeout 20s;
@@ -136,6 +147,8 @@ $t->run_daemon(\&backup_backend, port(8083));
 $t->run_daemon(\&primary_backend, port(8085));
 $t->run_daemon(\&failing_once_backend, port(8086));
 $t->run_daemon(\&backup_backend, port(8089));
+$t->run_daemon(\&backup_backend, port(8091));
+$t->waitforsocket('127.0.0.1:' . port(8091)) or die "backend did not start\n";
 $t->waitforsocket('127.0.0.1:' . port(8089)) or die "backend did not start\n";
 $t->run_daemon(\&backup_backend, port(8088));
 $t->waitforsocket('127.0.0.1:' . port(8086)) or die "backend did not start\n";
@@ -248,6 +261,43 @@ ok($elapsed < 2, 'served when A frees up, not at the queue timeout')
 	unlike($log, qr/connect\(\) failed.*"GET \/lf\/Z2 /,
 		'lf: turning a peer away from a queued request does not count '
 		. 'as a passed check');
+}
+
+# Fifth upstream: H holds the primary for good; nothing listens on the
+# only backup B1 (max_fails=2, fail_timeout=1s).  X1 and X2 fail on B1,
+# which disables it, and queue; R, with no failures of its own, queues
+# behind them.  Once fail_timeout is up, the retry timer's probe for R has
+# round-robin pick B1 to re-check it, and hands it back - which used to
+# count as a check that passed and reset B1's fails to 0.  R's real
+# attempt then fails on B1: with fails reset that is only 1 of 2, and Z,
+# right after, went to B1 as well; without, B1 is disabled again, and Z
+# stays off it.
+
+{
+	my $h = send_request('/pr/H');
+	select(undef, undef, undef, 0.2);
+	my $x1 = send_request('/pr/X1');
+	select(undef, undef, undef, 0.1);
+	my $x2 = send_request('/pr/X2');
+	select(undef, undef, undef, 0.1);
+	my $r = send_request('/pr/R');
+
+	my $log = '';
+	for (1 .. 40) {
+		$log = $t->read_file('error.log');
+		last if $log =~ /connect\(\) failed.*"GET \/pr\/R /;
+		select(undef, undef, undef, 0.1);
+	}
+
+	my $z = send_request('/pr/Z');
+	select(undef, undef, undef, 0.3);
+	$log = $t->read_file('error.log');
+
+	like($log, qr/connect\(\) failed.*"GET \/pr\/R /,
+		'pr: R tried B1 once its fail_timeout was over');
+	unlike($log, qr/connect\(\) failed.*"GET \/pr\/Z /,
+		'pr: a probe handing back a re-checked peer does not count as a '
+		. 'passed check');
 }
 
 ###############################################################################
