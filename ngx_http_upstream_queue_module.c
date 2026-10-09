@@ -23,10 +23,11 @@ typedef struct {
 #if defined ngx_http_upstream_conf_changed
     /*
      * Angie, told apart by ngx_http_upstream_conf_changed(), takes
-     * u->peer.data for round-robin's peer data in an upstream with a zone
-     * (ngx_http_upstream_need_connection_drop() follows rrp->current on
-     * every request) - and u->peer.data is ours. So lead with one, its
-     * current set after every peer.get to the wrapped balancer's.
+     * u->peer.data for round-robin's peer data in an upstream with a zone:
+     * ngx_http_upstream_need_connection_drop() follows rrp->current on
+     * every request, ngx_http_upstream_stat() rrp->peers and rrp->current.
+     * And u->peer.data is ours. So lead with one, a copy of the wrapped
+     * balancer's after every peer.get (see peer_get()).
      */
     ngx_http_upstream_rr_peer_data_t rrp;
 #endif
@@ -449,7 +450,24 @@ static ngx_int_t ngx_http_upstream_queue_peer_get(ngx_peer_connection_t *pc, voi
     ngx_http_upstream_queue_data_t *d = data;
     ngx_int_t rc = ngx_http_upstream_queue_get(d, pc);
 #if defined ngx_http_upstream_conf_changed
-    if (rc == NGX_OK) d->rrp.current = d->rr ? ((ngx_http_upstream_rr_peer_data_t *) d->peer.data)->current : NULL;
+    if (rc == NGX_OK) {
+        if (d->rr) {
+            d->rrp = *(ngx_http_upstream_rr_peer_data_t *) d->peer.data;
+        } else {
+            /*
+             * A balancer with peer data of its own has no round-robin peer
+             * to point Angie at: give it blank stand-ins, which it reads
+             * safely (no shared pool, so no locking; not a zombie) and whose
+             * statistics nobody looks at. Only a safeguard - Angie's zone
+             * copies round-robin peers, and fails to start with a balancer
+             * that has others, such as the third-party fair.
+             */
+            static ngx_http_upstream_rr_peers_t no_peers;
+            static ngx_http_upstream_rr_peer_t no_peer;
+            d->rrp.peers = &no_peers;
+            d->rrp.current = &no_peer;
+        }
+    }
 #endif
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "peer.get = %i", rc);
     if (rc != NGX_BUSY) { d->deadline_set = 0; return rc; }
